@@ -1,0 +1,16 @@
+[package]
+name = "shift"
+version = { workspace = true }
+edition = { workspace = true }
+
+[dependencies]
+easydrm = { workspace = true }
+tab-protocol = { path = "../tab-protocol" }
+tab-server = { path = "../tab-server", features = ["easydrm"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+nix = { workspace = true }
+thiserror = { workspace = true }
+libc = "0.2"
+[build-dependencies]
+gl_generator = "0.14"
