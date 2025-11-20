@@ -1,0 +1,12 @@
+[package]
+name = "tab-server"
+version = { workspace = true }
+edition = { workspace = true }
+
+[dependencies]
+tab-protocol = { path = "../tab-protocol" }
+thiserror = { workspace = true }
+base64 = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+nix = { workspace = true }

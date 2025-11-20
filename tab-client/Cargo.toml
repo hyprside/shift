@@ -1,0 +1,18 @@
+[package]
+name = "tab-client"
+version = { workspace = true }
+edition = { workspace = true }
+
+[lib]
+name = "tab_client"
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[dependencies]
+libc = "0.2"
+tab-protocol = { path = "../tab-protocol" }
+thiserror = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

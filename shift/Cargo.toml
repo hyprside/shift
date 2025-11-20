@@ -1,0 +1,12 @@
+[package]
+name = "shift"
+version = { workspace = true }
+edition = { workspace = true }
+
+[dependencies]
+easydrm = "0.1.0"
+tab-protocol = { path = "../tab-protocol" }
+tab-server = { path = "../tab-server" }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+nix = { workspace = true }
