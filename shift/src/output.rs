@@ -8,6 +8,7 @@ pub struct OutputContext {
 	monitor_id: Option<String>,
 	pub egl: Egl,
 	pub renderer: MonitorRenderer,
+	pending_sessions: Vec<String>,
 }
 
 impl OutputContext {
@@ -18,10 +19,19 @@ impl OutputContext {
 			monitor_id: None,
 			egl,
 			renderer,
+			pending_sessions: Vec::new(),
 		}
 	}
 	pub fn monitor_id(&self) -> Option<&str> {
 		self.monitor_id.as_deref()
+	}
+
+	pub fn take_pending_sessions(&mut self) -> Vec<String> {
+		std::mem::take(&mut self.pending_sessions)
+	}
+
+	pub fn set_pending_sessions(&mut self, sessions: Vec<String>) {
+		self.pending_sessions = sessions;
 	}
 }
 

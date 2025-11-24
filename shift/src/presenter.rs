@@ -33,6 +33,10 @@ impl FramePresenter {
 				Some(id) => id.to_string(),
 				None => continue,
 			};
+			let pending = monitor.context_mut().take_pending_sessions();
+			for session_id in pending {
+				rendered.push((monitor_id.clone(), session_id));
+			}
 			let Some(snapshot_monitor) = monitor_lookup.get(monitor_id.as_str()) else {
 				continue;
 			};
@@ -42,9 +46,7 @@ impl FramePresenter {
 				snapshot.transition.as_ref(),
 				snapshot.active_session_id,
 			)?;
-			for session_id in sessions {
-				rendered.push((monitor_id.clone(), session_id));
-			}
+			monitor.context_mut().set_pending_sessions(sessions);
 		}
 		Ok(rendered)
 	}
