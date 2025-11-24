@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
 
 use tab_protocol::{BufferIndex, MonitorInfo};
 
@@ -10,8 +11,9 @@ pub trait MonitorIdStorage {
 pub struct Output<Texture> {
 	buffers: [Texture; 2],
 	current: Option<BufferIndex>,
-	queue: VecDeque<BufferIndex>,
+	queue: VecDeque<(BufferIndex, Instant)>,
 	pending_page_flip: bool,
+	current_swap_started: Option<Instant>,
 }
 impl<Texture> Output<Texture> {
 	pub fn current_texture(self) -> Option<Texture> {
@@ -50,6 +52,7 @@ impl<Texture> Monitor<Texture> {
 				current: None,
 				queue: VecDeque::new(),
 				pending_page_flip: false,
+				current_swap_started: None,
 			},
 		);
 	}
@@ -65,9 +68,10 @@ impl<Texture> Monitor<Texture> {
 				);
 			}
 			o.current = Some(buffer);
+			o.current_swap_started = Some(Instant::now());
 			o.pending_page_flip = true;
 		} else {
-			o.queue.push_back(buffer);
+			o.queue.push_back((buffer, Instant::now()));
 		}
 		true
 	}
@@ -78,19 +82,25 @@ impl<Texture> Monitor<Texture> {
 	pub fn remove_session(&mut self, session_id: &str) -> Option<Texture> {
 		self.outputs.remove(session_id)?.current_texture()
 	}
-	pub fn take_pending_page_flip(&mut self, session_id: &str) -> bool {
+	pub fn take_pending_page_flip(&mut self, session_id: &str) -> Option<Duration> {
 		let Some(o) = self.outputs.get_mut(session_id) else {
-			return false;
+			return None;
 		};
 		if o.pending_page_flip {
 			o.pending_page_flip = false;
-			if let Some(next) = o.queue.pop_front() {
+			let latency = o
+				.current_swap_started
+				.map(|start| start.elapsed())
+				.unwrap_or_default();
+			o.current_swap_started = None;
+			if let Some((next, started)) = o.queue.pop_front() {
 				o.current = Some(next);
+				o.current_swap_started = Some(started);
 				o.pending_page_flip = true;
 			}
-			true
+			Some(latency)
 		} else {
-			false
+			None
 		}
 	}
 }
