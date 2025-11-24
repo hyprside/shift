@@ -175,7 +175,13 @@ impl<Texture> TabServer<Texture> {
 				warn!(monitor_id = %monitor_id, "frame_done for unknown monitor");
 				continue;
 			};
-			if monitor.take_pending_page_flip(session_id) {
+			if let Some(latency) = monitor.take_pending_page_flip(session_id) {
+				tracing::trace!(
+					monitor_id = monitor_id,
+					session_id = session_id,
+					ms = latency.as_secs_f32() * 1000.0,
+					"frame_latency"
+				);
 				let frame = TabMessageFrame::raw(message_header::FRAME_DONE, monitor_id);
 				self.send_to_session(&frame, session_id);
 			}
