@@ -149,9 +149,8 @@ impl ShiftApp {
 	}
 
 	fn handle_input_event(&mut self, event: InputEventPayload) {
-		if self.handle_session_shortcut(&event) {
-			return;
-		}
+
+		if false {self.handle_session_shortcut(&event);}
 		self.server.forward_input_event(event);
 	}
 
