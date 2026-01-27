@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::{rendering_layer::RenderingLayer, server_layer::ShiftServer};
+use crate::{rendering_layer::{channels::Channels as RenderChannels, RenderingLayer}, server_layer::ShiftServer};
 
 mod client_layer;
 mod server_layer;
@@ -26,8 +26,12 @@ async fn main() {
         .map(PathBuf::from)
         .unwrap_or_else(|| "/tmp/shift.sock".into());
 
+    // ---- create inter-layer channels ----
+    let render_channels = RenderChannels::new();
+    let (server_render_channels, rendering_render_channels) = render_channels.split();
+
     // ---- create server ----
-    let mut server = match ShiftServer::bind(&socket_path).await {
+    let mut server = match ShiftServer::bind(&socket_path, server_render_channels).await {
         Ok(s) => s,
         Err(e) => {
             tracing::error!("failed to bind ShiftServer at {:?}: {e}", socket_path);
@@ -38,7 +42,7 @@ async fn main() {
     tracing::info!("starting ShiftServer on {:?}", socket_path);
 
     // ---- create rendering ----
-    let rendering = match RenderingLayer::init() {
+    let rendering = match RenderingLayer::init(rendering_render_channels) {
         Ok(r) => r,
         Err(e) => {
             tracing::error!("failed to init rendering layer: {e}");

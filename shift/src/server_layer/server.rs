@@ -6,7 +6,7 @@ use thiserror::Error;
 use tokio::{io::unix::AsyncFd, net::{UnixListener, UnixStream, unix::SocketAddr}, task::JoinHandle as TokioJoinHandle};
 use tracing::error;
 
-use crate::{auth::Token, client_layer::{client::{Client, ClientId}, client_view::{self, ClientView}}, comms::client2server::C2SMsg, sessions::{PendingSession, Role, Session, SessionId}};
+use crate::{auth::Token, client_layer::{client::{Client, ClientId}, client_view::{self, ClientView}}, comms::{client2server::C2SMsg, render2server::{RenderEvt, RenderEvtRx}, server2render::{RenderCmd, RenderCmdTx}}, rendering_layer::channels::ServerEnd as RenderServerChannels, sessions::{PendingSession, Role, Session, SessionId}};
 use crate::auth::error::Error as AuthError;
 struct ConnectedClient { client_view: ClientView, join_handle: TokioJoinHandle<()> }
 impl Drop for ConnectedClient {
@@ -19,7 +19,9 @@ pub struct ShiftServer {
     current_session: Option<SessionId>,
     pending_sessions: HashMap<Token, PendingSession>,
     active_sessions: HashMap<SessionId, Arc<Session>>,
-    connected_clients: HashMap<ClientId, ConnectedClient>
+    connected_clients: HashMap<ClientId, ConnectedClient>,
+    render_commands: RenderCmdTx,
+    render_events: RenderEvtRx,
 }
 #[derive(Error, Debug)]
 pub enum BindError {
@@ -28,15 +30,18 @@ pub enum BindError {
 }
 impl ShiftServer {
     #[tracing::instrument(level= "info", skip(path), fields(path = ?path.as_ref().display()))]
-    pub async fn bind(path: impl AsRef<Path>) -> Result<Self, BindError> {
+    pub async fn bind(path: impl AsRef<Path>, render_channels: RenderServerChannels) -> Result<Self, BindError> {
         std::fs::remove_file(&path).ok();
         let listener = UnixListener::bind(path)?;
+        let (render_events, render_commands) = render_channels.into_parts();
         Ok(Self {
             listener: Some(listener),
             current_session: Default::default(),
             pending_sessions: Default::default(),
             active_sessions: Default::default(),
             connected_clients: Default::default(),
+            render_commands,
+            render_events,
         })
     }
     #[tracing::instrument(level= "info", skip(self), fields(connected_clients=self.connected_clients.len(), active_sessions=self.active_sessions.len(), pending_sessions = self.pending_sessions.len(), current_session = ?self.current_session))]
@@ -52,8 +57,16 @@ impl ShiftServer {
         let listener = self.listener.take().unwrap();
         loop {
             tokio::select! {
-                client_message = self.read_clients_messages() => self.handle_client_message(client_message.0, client_message.1).await,
+                client_message = Self::read_clients_messages(&mut self.connected_clients) => self.handle_client_message(client_message.0, client_message.1).await,
                 accept_result = listener.accept() => self.handle_accept(accept_result).await,
+                render_event = self.render_events.recv() => {
+                    if let Some(event) = render_event {
+                        self.handle_render_event(event).await;
+                    } else {
+                        tracing::warn!("render layer event channel closed");
+                        return;
+                    }
+                }
             }
         }
     }
@@ -105,15 +118,42 @@ impl ShiftServer {
                     return;
                 }
             },
-            C2SMsg::SwapBuffers { monitor_id, buffer } => todo!(),
-            C2SMsg::FramebufferLink { payload, dma_bufs } => todo!()
+            C2SMsg::SwapBuffers { monitor_id, buffer } => {
+                if let Err(e) = self.render_commands.send(RenderCmd::SwapBuffers { monitor_id, buffer }).await {
+                    tracing::error!("failed to forward SwapBuffers to renderer: {e}");
+                    let code = Arc::<str>::from("render_unavailable");
+                    let detail = Some(Arc::<str>::from("renderer unavailable"));
+                    connected_client.client_view.notify_error(code, detail, true).await;
+                }
+            },
+            C2SMsg::FramebufferLink { payload, dma_bufs } => {
+                if let Err(e) = self.render_commands.send(RenderCmd::FramebufferLink { payload, dma_bufs }).await {
+                    tracing::error!("failed to forward FramebufferLink to renderer: {e}");
+                    let code = Arc::<str>::from("render_unavailable");
+                    let detail = Some(Arc::<str>::from("renderer unavailable"));
+                    connected_client.client_view.notify_error(code, detail, true).await;
+                }
+            }
         }
     }
-    async fn read_clients_messages(&mut self) -> (ClientId, C2SMsg) {
-        self.connected_clients.retain(|_, c| {
+    async fn handle_render_event(&mut self, event: RenderEvt) {
+        match event {
+            RenderEvt::MonitorOnline { monitor_id } => {
+                tracing::info!(%monitor_id, "renderer reports monitor online");
+            }
+            RenderEvt::MonitorOffline { monitor_id } => {
+                tracing::info!(%monitor_id, "renderer reports monitor offline");
+            }
+            RenderEvt::FatalError { reason } => {
+                tracing::error!(?reason, "renderer fatal error");
+            }
+        }
+    }
+    async fn read_clients_messages(connected_clients: &mut HashMap<ClientId, ConnectedClient>) -> (ClientId, C2SMsg) {
+        connected_clients.retain(|_, c| {
             c.client_view.has_messages()
         });
-        let futures = self.connected_clients.iter_mut().map(|c| Box::pin(async {
+        let futures = connected_clients.iter_mut().map(|c| Box::pin(async {
             let Some(msg) = c.1.client_view.read_message().await else {
                 return pending().await;
             };

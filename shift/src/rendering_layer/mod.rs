@@ -1,8 +1,14 @@
 #![allow(dead_code)]
 
+pub mod channels;
+
 use easydrm::{gl, EasyDRM, MonitorContextCreationRequest};
 use skia_safe::{self as skia, gpu, gpu::gl::FramebufferInfo};
 use thiserror::Error;
+use tracing::warn;
+
+use crate::comms::{render2server::{RenderEvt, RenderEvtTx}, server2render::{RenderCmd, RenderCmdRx}};
+use channels::RenderingEnd;
 
 // -----------------------------
 // Errors
@@ -78,19 +84,23 @@ impl MonitorRenderState {
 
 pub struct RenderingLayer {
     drm: EasyDRM<MonitorRenderState>,
+    command_rx: Option<RenderCmdRx>,
+    event_tx: RenderEvtTx,
 }
 
 impl RenderingLayer {
-    pub fn init() -> Result<Self, RenderError> {
+    pub fn init(channels: RenderingEnd) -> Result<Self, RenderError> {
+        let (command_rx, event_tx) = channels.into_parts();
         let drm = EasyDRM::init(|req| {
             // O EasyDRM chama isto com o contexto do monitor já válido/current.
             MonitorRenderState::new(req).expect("MonitorRenderState::new failed")
         })?;
 
-        Ok(Self { drm })
+        Ok(Self { drm, command_rx: Some(command_rx), event_tx })
     }
 
     pub async fn run(mut self) -> Result<(), RenderError> {
+        let mut command_rx = self.command_rx.take().expect("render command channel missing");
         loop {
             // Mantém as surfaces a seguir ao tamanho real do monitor
             for mon in self.drm.monitors_mut() {
@@ -108,7 +118,22 @@ impl RenderingLayer {
             }
 
             self.drm.swap_buffers()?;
-            self.drm.poll_events_async().await?;
+
+            tokio::select! {
+                cmd = command_rx.recv() => {
+                    if let Some(cmd) = cmd {
+                        if !self.handle_command(cmd).await? {
+                            return Ok(());
+                        }
+                    } else {
+                        warn!("server→renderer channel closed, shutting down renderer");
+                        return Ok(());
+                    }
+                }
+                result = self.drm.poll_events_async() => {
+                    result?;
+                }
+            }
         }
     }
 
@@ -118,6 +143,31 @@ impl RenderingLayer {
 
     pub fn drm_mut(&mut self) -> &mut EasyDRM<MonitorRenderState> {
         &mut self.drm
+    }
+}
+
+impl RenderingLayer {
+    async fn handle_command(&mut self, cmd: RenderCmd) -> Result<bool, RenderError> {
+        match cmd {
+            RenderCmd::Shutdown => {
+                warn!("received shutdown request from server");
+                return Ok(false);
+            }
+            RenderCmd::FramebufferLink { payload, .. } => {
+                warn!(?payload, "framebuffer link command received but renderer handling is not implemented yet");
+            }
+            RenderCmd::SwapBuffers { monitor_id, buffer } => {
+                warn!(%monitor_id, ?buffer, "swap buffers command received but renderer handling is not implemented yet");
+            }
+        }
+
+        Ok(true)
+    }
+
+    async fn emit_event(&self, event: RenderEvt) {
+        if let Err(e) = self.event_tx.send(event).await {
+            warn!("failed to send renderer event to server: {e}");
+        }
     }
 }
 
