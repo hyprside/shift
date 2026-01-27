@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::server_layer::ShiftServer;
+use crate::{rendering_layer::RenderingLayer, server_layer::ShiftServer};
 
 mod client_layer;
 mod server_layer;
@@ -9,6 +9,7 @@ mod ids;
 mod sessions;
 mod auth;
 mod monitor;
+mod rendering_layer;
 #[tokio::main]
 async fn main() {
     // ---- logging/tracing ----
@@ -35,6 +36,17 @@ async fn main() {
     };
     server.add_initial_session();
     tracing::info!("starting ShiftServer on {:?}", socket_path);
-    server.start().await;
 
+    // ---- create rendering ----
+    let rendering = match RenderingLayer::init() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("failed to init rendering layer: {e}");
+            return;
+        }
+    };
+    let result = tokio::join!(server.start(), rendering.run());
+    if let Err(e) = result.1 {
+        tracing::error!("rendering thread ended with error: {e}");
+    }
 }
