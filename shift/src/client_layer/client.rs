@@ -318,6 +318,7 @@ impl Client {
 						tracing::warn!(%monitor_id, "failed to send frame_done: {e}");
 						break;
 					}
+					tracing::trace!("frame_done sent to the client for monitor {monitor_id}")
 				}
 			}
 			S2CMsg::MonitorAdded { monitor } => {

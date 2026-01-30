@@ -71,13 +71,9 @@ impl DmaBufTexture {
 		if context.is_null() {
 			return Err(DmaBufImportError::MissingContext);
 		}
-
 		let raw_fd = params.fd.into_raw_fd();
 		let mut attrs = [
-			egl::WIDTH as i32,
-			params.width,
-			egl::HEIGHT as i32,
-			params.height,
+			
 			egl::LINUX_DRM_FOURCC_EXT as i32,
 			params.fourcc,
 			egl::DMA_BUF_PLANE0_FD_EXT as i32,
@@ -86,6 +82,10 @@ impl DmaBufTexture {
 			params.offset,
 			egl::DMA_BUF_PLANE0_PITCH_EXT as i32,
 			params.stride,
+			egl::WIDTH as i32,
+			params.width,
+			egl::HEIGHT as i32,
+			params.height,
 			egl::NONE as i32,
 		];
 
@@ -158,7 +158,7 @@ impl DmaBufTexture {
 			texture_id: texture,
 			width: params.width,
 			height: params.height,
-			fourcc: params.fourcc,
+			fourcc: params.fourcc
 		})
 	}
 
@@ -210,7 +210,7 @@ impl SkiaDmaBufTexture {
 	/// Splits into the skia texture and inner opengl texture
 	///
 	/// # Safety
-	/// The caller is responsible for keeping `DmaBufTexture`` alive while `BackendTexture` is alive.
+	/// The caller is responsible for keeping `DmaBufTexture` alive while `BackendTexture` is alive.
 	pub unsafe fn into_inner(self) -> (gpu::BackendTexture, DmaBufTexture) {
 		(self.backend_texture, self.source)
 	}

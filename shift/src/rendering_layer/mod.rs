@@ -96,8 +96,8 @@ impl MonitorRenderState {
 
 	pub fn get_server_layer_monitor(monitor: &Monitor<Self>) -> ServerLayerMonitor {
 		crate::monitor::Monitor {
-			height: monitor.size().0 as _,
-			width: monitor.size().1 as _,
+			height: monitor.size().1 as _,
+			width: monitor.size().0 as _,
 			id: monitor.context().id,
 			name: format!("Monitor {}", u32::from(monitor.connector_id())),
 			refresh_rate: monitor.active_mode().vrefresh(),
@@ -110,19 +110,25 @@ impl MonitorRenderState {
 			&texture.backend_texture,
 			gpu::SurfaceOrigin::TopLeft,
 			skia::ColorType::RGBA8888,
-			AlphaType::Premul,
+			AlphaType::Opaque,
 			None,
 		) else {
 			return Err(RenderError::SkiaSurface);
 		};
 		let rect = skia::Rect::from_wh(self.width as f32, self.height as f32);
-		let sampling = SamplingOptions::new(FilterMode::Linear, MipmapMode::None);
-		let paint = Paint::default();
+		let sampling = SamplingOptions::new(FilterMode::Nearest, MipmapMode::Nearest);
+		let mut paint = Paint::default();
+		paint.set_alpha_f(1.0);
+		paint.set_argb(255, 255, 0,0);
+		self.canvas().draw_rect(rect, &paint);
+		paint.set_argb(255, 255, 255, 255);
 		self
 			.canvas()
 			.draw_image_rect_with_sampling_options(image, None, rect, sampling, &paint);
+		
 		Ok(())
 	}
+
 }
 
 #[derive(Default, Debug)]
@@ -190,7 +196,7 @@ pub struct RenderingLayer {
 	command_rx: Option<RenderCmdRx>,
 	event_tx: RenderEvtTx,
 	known_monitors: HashMap<MonitorId, ServerLayerMonitor>,
-	monitor_state: HashMap<MonitorId, MonitorSurfaceState>,
+	monitor_state: HashMap<(MonitorId, SessionId), MonitorSurfaceState>,
 	slots: HashMap<SlotKey, SkiaDmaBufTexture>,
 	current_session: Option<SessionId>,
 }
@@ -226,54 +232,47 @@ impl RenderingLayer {
 			})
 			.await;
 		self.known_monitors = current.into_iter().map(|m| (m.id, m)).collect();
-		self.monitor_state = self
-			.known_monitors
-			.keys()
-			.copied()
-			.map(|id| (id, MonitorSurfaceState::default()))
-			.collect();
+
 		loop {
 			// Mantém as surfaces a seguir ao tamanho real do monitor
 			let monitor_ids: Vec<MonitorId> = self.drm.monitors().map(|mon| mon.context().id).collect();
-			for id in &monitor_ids {
-				self.monitor_state.entry(*id).or_default();
-			}
-			let monitor_state_ptr = &self.monitor_state as *const HashMap<MonitorId, MonitorSurfaceState>;
-			let slots_ptr = &self.slots as *const HashMap<SlotKey, SkiaDmaBufTexture>;
 			let current_session = self.current_session;
+			if let Some(s) = current_session {
+				for id in &monitor_ids {
+					self.monitor_state.entry((*id, s)).or_default();
+				}
+			}
 			for mon in self.drm.monitors_mut() {
 				if mon.can_render() && mon.make_current().is_ok() {
 					let monitor_id = mon.context().id;
 					let mode = mon.active_mode();
 					let (w, h) = (mode.size().0 as usize, mode.size().1 as usize);
-					mon.context_mut().ensure_surface_size(w, h)?;
-
-					let canvas = mon.context_mut().canvas();
-					canvas.clear(skia::Color::BLUE);
-
-					let texture_ptr = unsafe {
-						current_session
-							.and_then(|session_id| {
-								(*monitor_state_ptr)
-									.get(&monitor_id)
-									.and_then(|state| state.current_buffer)
-									.map(|buffer| SlotKey::new(monitor_id, session_id, buffer))
-							})
-							.and_then(|key| {
-								(*slots_ptr)
-									.get(&key)
-									.map(|texture| texture as *const SkiaDmaBufTexture)
-							})
-					};
-
-					if let Some(ptr) = texture_ptr {
-						let texture = unsafe { &*ptr };
-						if let Err(e) = mon.context_mut().draw_texture(texture) {
+					let context = mon.context_mut();
+					context.ensure_surface_size(w, h)?;
+					
+					let texture = current_session
+						.and_then(|session_id| {
+							self.monitor_state
+								.get(&(monitor_id, session_id))
+								.and_then(|state| state.current_buffer)
+								.map(|buffer| SlotKey::new(monitor_id, session_id, buffer))
+						})
+						.and_then(|key| {
+							self.slots
+								.get(&key)
+						});
+					if let Some(texture) = texture {
+						let canvas = context.canvas();
+						canvas.clear(skia::Color::BLUE);
+						if let Err(e) = context.draw_texture(texture) {
 							warn!(%monitor_id, "failed to draw client texture: {e:?}");
 						}
+					} else {
+						let canvas = context.canvas();
+						canvas.clear(skia::Color::BLACK);
 					}
 
-					mon.context_mut().flush();
+					context.flush();
 				}
 			}
 			self.drm.swap_buffers()?;
@@ -334,9 +333,6 @@ impl RenderingLayer {
 						monitor: monitor.clone(),
 					})
 					.await;
-				self
-					.monitor_state
-					.insert(monitor.id, MonitorSurfaceState::default());
 			}
 			current_map.insert(monitor.id, monitor);
 		}
@@ -352,7 +348,7 @@ impl RenderingLayer {
 					monitor_id: removed_id,
 				})
 				.await;
-			self.monitor_state.remove(&removed_id);
+			self.monitor_state.retain(|(mon, _), _| *mon != removed_id);
 			self.cleanup_monitor_slots(removed_id);
 		}
 		self.known_monitors = current_map;
@@ -363,8 +359,8 @@ impl RenderingLayer {
 	}
 
 	fn texture_for_monitor(&self, monitor_id: MonitorId) -> Option<&SkiaDmaBufTexture> {
-		let state = self.monitor_state.get(&monitor_id)?;
 		let session_id = self.current_session?;
+		let state = self.monitor_state.get(&(monitor_id, session_id))?;
 		let buffer = state.current_buffer?;
 		let key = SlotKey::new(monitor_id, session_id, buffer);
 		self.slots.get(&key)
@@ -464,11 +460,12 @@ impl RenderingLayer {
 					self.current_session = None;
 				}
 			}
-			RenderCmd::SwapBuffers { monitor_id, buffer } => {
+			RenderCmd::SwapBuffers { monitor_id, buffer, session_id } => {
+				tracing::debug!("swap buffers {monitor_id} -> {buffer:?}");
 				let slot = BufferSlot::from(buffer);
 				self
 					.monitor_state
-					.entry(monitor_id)
+					.entry((monitor_id, session_id))
 					.or_default()
 					.current_buffer = Some(slot);
 			}
