@@ -308,17 +308,14 @@ impl Client {
 			}
 			S2CMsg::FrameDone { monitors } => {
 				for monitor_id in monitors {
-					let payload = FrameDonePayload {
-						monitor_id: monitor_id.to_string(),
-					};
-					let send_result = TabMessageFrame::json(message_header::FRAME_DONE, payload)
+					let send_result =
+						TabMessageFrame::raw(message_header::FRAME_DONE, monitor_id.to_string())
 						.send_frame_to_async_fd(&self.socket)
 						.await;
 					if let Err(e) = send_result {
 						tracing::warn!(%monitor_id, "failed to send frame_done: {e}");
 						break;
 					}
-					tracing::trace!("frame_done sent to the client for monitor {monitor_id}")
 				}
 			}
 			S2CMsg::MonitorAdded { monitor } => {

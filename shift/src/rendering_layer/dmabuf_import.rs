@@ -73,7 +73,7 @@ impl DmaBufTexture {
 		}
 		let raw_fd = params.fd.into_raw_fd();
 		let mut attrs = [
-			
+
 			egl::LINUX_DRM_FOURCC_EXT as i32,
 			params.fourcc,
 			egl::DMA_BUF_PLANE0_FD_EXT as i32,
@@ -161,20 +161,22 @@ impl DmaBufTexture {
 			fourcc: params.fourcc
 		})
 	}
-
-	pub fn to_skia(self, label: impl AsRef<str>) -> Result<SkiaDmaBufTexture, DmaBufImportError> {
-		let texture_info = gpu::gl::TextureInfo {
+	fn skia_tex_info(&self) -> gpu::gl::TextureInfo {
+		gpu::gl::TextureInfo {
 			target: gl::TEXTURE_2D as gpu::gl::Enum,
 			id: self.texture_id as gpu::gl::Enum,
 			format: gpu::gl::Format::RGBA8.into(),
 			protected: gpu::Protected::No,
-		};
+		}
+	}
+	pub fn to_skia(self, label: impl AsRef<str>) -> Result<SkiaDmaBufTexture, DmaBufImportError> {
+
 
 		let backend_texture = unsafe {
 			gpu::backend_textures::make_gl(
 				(self.width, self.height),
 				gpu::Mipmapped::No,
-				texture_info,
+				self.skia_tex_info(),
 				label,
 			)
 		};
@@ -182,6 +184,7 @@ impl DmaBufTexture {
 		Ok(SkiaDmaBufTexture {
 			backend_texture,
 			source: self,
+
 		})
 	}
 }
@@ -213,5 +216,16 @@ impl SkiaDmaBufTexture {
 	/// The caller is responsible for keeping `DmaBufTexture` alive while `BackendTexture` is alive.
 	pub unsafe fn into_inner(self) -> (gpu::BackendTexture, DmaBufTexture) {
 		(self.backend_texture, self.source)
+	}
+
+	pub fn update(&mut self) {
+		self.backend_texture = unsafe {
+			gpu::backend_textures::make_gl(
+				(self.source.width, self.source.height),
+				gpu::Mipmapped::No,
+				self.source.skia_tex_info(),
+				self.backend_texture.label(),
+			)
+		};
 	}
 }

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs::Permissions, future::pending, io, os::unix::fs::PermissionsExt, path::Path, sync::Arc};
+use std::{collections::{HashMap, HashSet}, fs::Permissions, future::pending, io, os::unix::fs::PermissionsExt, path::Path, sync::Arc};
 
 use futures::future::select_all;
 use tab_protocol::TabMessageFrame;
@@ -44,6 +44,9 @@ pub struct ShiftServer {
 	render_commands: RenderCmdTx,
 	render_events: RenderEvtRx,
 	monitors: HashMap<MonitorId, Monitor>,
+	waiting_flip: Vec<(SessionId, MonitorId)>,
+	swap_buffers_received: u64,
+	frame_done_emitted: u64,
 }
 #[derive(Error, Debug)]
 pub enum BindError {
@@ -69,6 +72,9 @@ impl ShiftServer {
 			render_commands,
 			render_events,
 			monitors: Default::default(),
+			waiting_flip: Default::default(),
+			swap_buffers_received: 0,
+			frame_done_emitted: 0,
 		})
 	}
 	#[tracing::instrument(level= "info", skip(self), fields(connected_clients=self.connected_clients.len(), active_sessions=self.active_sessions.len(), pending_sessions = self.pending_sessions.len(), current_session = ?self.current_session))]
@@ -79,13 +85,33 @@ impl ShiftServer {
 		tracing::info!(?token, %id, "added initial admin session");
 		token
 	}
-	#[tracing::instrument(level= "trace", skip(self), fields(connected_clients=self.connected_clients.len(), active_sessions=self.active_sessions.len(), pending_sessions = self.pending_sessions.len(), current_session = ?self.current_session))]
 	pub async fn start(mut self) {
 		let listener = self.listener.take().unwrap();
+		let mut stats_tick = tokio::time::interval(std::time::Duration::from_secs(1));
 		loop {
+			let span = tracing::trace_span!(
+				"server_loop",
+				connected_clients = self.connected_clients.len(),
+				active_sessions = self.active_sessions.len(),
+				pending_sessions = self.pending_sessions.len(),
+				current_session = ?self.current_session,
+				waiting_flip = self.waiting_flip.len(),
+			);
+			let _span = span.enter();
 			tokio::select! {
 					client_message = Self::read_clients_messages(&mut self.connected_clients) => self.handle_client_message(client_message.0, client_message.1).await,
 					accept_result = listener.accept() => self.handle_accept(accept_result).await,
+					_ = stats_tick.tick() => {
+							if self.swap_buffers_received > 0 || self.frame_done_emitted > 0 {
+									tracing::trace!(
+											swap_buffers_received = self.swap_buffers_received,
+											frame_done_emitted = self.frame_done_emitted,
+											"server stats per second"
+									);
+							}
+							self.swap_buffers_received = 0;
+							self.frame_done_emitted = 0;
+					}
 					render_event = self.render_events.recv() => {
 							if let Some(event) = render_event {
 									self.handle_render_event(event).await;
@@ -187,9 +213,26 @@ impl ShiftServer {
 				}
 			}
 			C2SMsg::SwapBuffers { monitor_id, buffer } => {
+
+				let Some(connected_client) = self.connected_clients.get_mut(&client_id) else {
+					tracing::warn!("tried handling message from a non-existing client");
+					return;
+				};
+				let client_session = connected_client
+					.client_view
+					.authenticated_session()
+					.and_then(|s| self.active_sessions.get(&s))
+					.map(Arc::clone);
+				let Some(client_session) = client_session else {
+					connected_client
+						.client_view
+						.notify_error("forbidden".into(), None, false)
+						.await;
+					return;
+				};
 				if let Err(e) = self
 					.render_commands
-					.send(RenderCmd::SwapBuffers { monitor_id, buffer })
+					.send(RenderCmd::SwapBuffers { monitor_id, buffer, session_id: client_session.id() })
 					.await
 				{
 					tracing::error!("failed to forward SwapBuffers to renderer: {e}");
@@ -198,6 +241,9 @@ impl ShiftServer {
 					if let Some(client) = self.connected_clients.get_mut(&client_id) {
 						client.client_view.notify_error(code, detail, true).await;
 					}
+				} else {
+					self.waiting_flip.push((client_session.id(), monitor_id));
+					self.swap_buffers_received = self.swap_buffers_received.saturating_add(1);
 				}
 			}
 			C2SMsg::FramebufferLink { payload, dma_bufs } => {
@@ -270,8 +316,29 @@ impl ShiftServer {
 					tracing::debug!(%active_session, "page flip ignored: no client bound to active session");
 					return;
 				};
-				if !client.client_view.notify_frame_done(monitors).await {
+				let mut flipped_and_waited_monitors = Vec::with_capacity(monitors.len());
+				// Only acknowledge one pending swap per monitor per page flip.
+				for monitor in &monitors {
+					if let Some(pos) = self
+						.waiting_flip
+						.iter()
+						.position(|(s, m)| s == &active_session && m == monitor)
+					{
+						self.waiting_flip.remove(pos);
+						flipped_and_waited_monitors.push(*monitor);
+					}
+				}
+				if flipped_and_waited_monitors.is_empty() {
+					return;
+				}
+				if !client
+					.client_view
+					.notify_frame_done(flipped_and_waited_monitors)
+					.await
+				{
 					tracing::warn!(%active_session, "failed to forward frame_done to client");
+				} else {
+					self.frame_done_emitted = self.frame_done_emitted.saturating_add(1);
 				}
 			}
 		}

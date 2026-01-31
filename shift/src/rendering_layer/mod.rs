@@ -4,7 +4,7 @@ pub mod channels;
 pub mod dmabuf_import;
 mod egl;
 
-use easydrm::{EasyDRM, Monitor, MonitorContextCreationRequest, gl};
+use easydrm::{gl::{self, COLOR_BUFFER_BIT, DEPTH_BUFFER_BIT}, EasyDRM, Monitor, MonitorContextCreationRequest};
 use skia_safe::{
 	self as skia, AlphaType, FilterMode, MipmapMode, Paint, SamplingOptions, gpu,
 	gpu::gl::FramebufferInfo,
@@ -125,7 +125,7 @@ impl MonitorRenderState {
 		self
 			.canvas()
 			.draw_image_rect_with_sampling_options(image, None, rect, sampling, &paint);
-		
+
 		Ok(())
 	}
 
@@ -233,7 +233,7 @@ impl RenderingLayer {
 			.await;
 		self.known_monitors = current.into_iter().map(|m| (m.id, m)).collect();
 
-		loop {
+		'e: loop {
 			// Mantém as surfaces a seguir ao tamanho real do monitor
 			let monitor_ids: Vec<MonitorId> = self.drm.monitors().map(|mon| mon.context().id).collect();
 			let current_session = self.current_session;
@@ -244,32 +244,32 @@ impl RenderingLayer {
 			}
 			for mon in self.drm.monitors_mut() {
 				if mon.can_render() && mon.make_current().is_ok() {
+					unsafe{mon.gl().Clear(COLOR_BUFFER_BIT | DEPTH_BUFFER_BIT); };
+
 					let monitor_id = mon.context().id;
 					let mode = mon.active_mode();
 					let (w, h) = (mode.size().0 as usize, mode.size().1 as usize);
 					let context = mon.context_mut();
 					context.ensure_surface_size(w, h)?;
-					
+
 					let texture = current_session
 						.and_then(|session_id| {
 							self.monitor_state
-								.get(&(monitor_id, session_id))
+								.get_mut(&(monitor_id, session_id))
 								.and_then(|state| state.current_buffer)
 								.map(|buffer| SlotKey::new(monitor_id, session_id, buffer))
 						})
 						.and_then(|key| {
 							self.slots
-								.get(&key)
+								.get_mut(&key)
 						});
 					if let Some(texture) = texture {
+						unsafe{context.gl.ClearColor(1.0, 0.0, 0.0, 1.0)};
 						let canvas = context.canvas();
-						canvas.clear(skia::Color::BLUE);
+						// texture.update();
 						if let Err(e) = context.draw_texture(texture) {
 							warn!(%monitor_id, "failed to draw client texture: {e:?}");
 						}
-					} else {
-						let canvas = context.canvas();
-						canvas.clear(skia::Color::BLACK);
 					}
 
 					context.flush();
@@ -281,11 +281,11 @@ impl RenderingLayer {
 					cmd = command_rx.recv() => {
 						if let Some(cmd) = cmd {
 							if !self.handle_command(cmd).await? {
-								return Ok(());
+								break 'e;
 							}
 						} else {
 							warn!("server→renderer channel closed, shutting down renderer");
-							return Ok(());
+							break 'e;
 						}
 					}
 					result = self.drm.poll_events_async() => {
@@ -295,7 +295,9 @@ impl RenderingLayer {
 					}
 				}
 			}
-		}
+		};
+		warn!("shutting down renderer");
+		Ok(())
 	}
 	async fn on_after_poll_events(&mut self) {
 		let page_flipped_monitors = self
@@ -461,7 +463,6 @@ impl RenderingLayer {
 				}
 			}
 			RenderCmd::SwapBuffers { monitor_id, buffer, session_id } => {
-				tracing::debug!("swap buffers {monitor_id} -> {buffer:?}");
 				let slot = BufferSlot::from(buffer);
 				self
 					.monitor_state
