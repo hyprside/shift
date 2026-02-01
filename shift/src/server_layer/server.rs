@@ -9,6 +9,7 @@ use tokio::{
 	task::JoinHandle as TokioJoinHandle,
 };
 use tracing::error;
+use shift_profiler as profiler;
 
 use crate::auth::error::Error as AuthError;
 use crate::{
@@ -89,6 +90,8 @@ impl ShiftServer {
 		let listener = self.listener.take().unwrap();
 		let mut stats_tick = tokio::time::interval(std::time::Duration::from_secs(1));
 		loop {
+			profiler::report_if_due();
+			let _loop_span = profiler::span("server.loop");
 			let span = tracing::trace_span!(
 				"server_loop",
 				connected_clients = self.connected_clients.len(),
@@ -99,9 +102,17 @@ impl ShiftServer {
 			);
 			let _span = span.enter();
 			tokio::select! {
-					client_message = Self::read_clients_messages(&mut self.connected_clients) => self.handle_client_message(client_message.0, client_message.1).await,
-					accept_result = listener.accept() => self.handle_accept(accept_result).await,
+					client_message = Self::read_clients_messages(&mut self.connected_clients) => {
+						let _span = profiler::span("server.handle_client_message");
+						profiler::record("server.client_message");
+						self.handle_client_message(client_message.0, client_message.1).await
+					},
+					accept_result = listener.accept() => {
+						let _span = profiler::span("server.accept");
+						self.handle_accept(accept_result).await
+					},
 					_ = stats_tick.tick() => {
+							let _span = profiler::span("server.stats_tick");
 							if self.swap_buffers_received > 0 || self.frame_done_emitted > 0 {
 									tracing::trace!(
 											swap_buffers_received = self.swap_buffers_received,
@@ -113,7 +124,9 @@ impl ShiftServer {
 							self.frame_done_emitted = 0;
 					}
 					render_event = self.render_events.recv() => {
+							let _span = profiler::span("server.handle_render_event");
 							if let Some(event) = render_event {
+									profiler::record("server.render_event");
 									self.handle_render_event(event).await;
 							} else {
 									tracing::warn!("render layer event channel closed");
@@ -126,11 +139,13 @@ impl ShiftServer {
 
 	#[tracing::instrument(level= "trace", skip(self), fields(connected_clients=self.connected_clients.len(), active_sessions=self.active_sessions.len(), pending_sessions = self.pending_sessions.len(), current_session = ?self.current_session))]
 	async fn handle_client_message(&mut self, client_id: ClientId, message: C2SMsg) {
+		let _span = profiler::span("server.handle_client_message.dispatch");
 		match message {
 			C2SMsg::Shutdown => {
 				self.disconnect_client(client_id).await;
 			}
 			C2SMsg::Auth(token) => {
+				let _span = profiler::span("server.handle_auth");
 				let Some(pending_session) = self.pending_sessions.remove(&token) else {
 					if let Some(client) = self.connected_clients.get_mut(&client_id) {
 						client
@@ -164,6 +179,7 @@ impl ShiftServer {
 				}
 			}
 			C2SMsg::CreateSession(req) => {
+				let _span = profiler::span("server.handle_create_session");
 				let mut remove_client = false;
 				{
 					let Some(connected_client) = self.connected_clients.get_mut(&client_id) else {
@@ -213,7 +229,8 @@ impl ShiftServer {
 				}
 			}
 			C2SMsg::SwapBuffers { monitor_id, buffer } => {
-
+				let _span = profiler::span("server.handle_swap_buffers");
+				profiler::record("server.swap_buffers.recv");
 				let Some(connected_client) = self.connected_clients.get_mut(&client_id) else {
 					tracing::warn!("tried handling message from a non-existing client");
 					return;
@@ -247,6 +264,7 @@ impl ShiftServer {
 				}
 			}
 			C2SMsg::FramebufferLink { payload, dma_bufs } => {
+				let _span = profiler::span("server.handle_framebuffer_link");
 				let session_id = {
 					let Some(client) = self.connected_clients.get_mut(&client_id) else {
 						tracing::warn!("tried handling message from a non-existing client");
@@ -281,31 +299,37 @@ impl ShiftServer {
 		}
 	}
 	async fn handle_render_event(&mut self, event: RenderEvt) {
+		let _span = profiler::span("server.handle_render_event.dispatch");
 		match event {
 			RenderEvt::Started { monitors } => {
+				let _span = profiler::span("server.render_started");
 				self.monitors = monitors.into_iter().map(|m| (m.id, m)).collect();
 			}
 			RenderEvt::MonitorOnline { monitor } => {
+				let _span = profiler::span("server.render_monitor_online");
 				tracing::info!(?monitor, "renderer reports monitor online");
 				self.broadcast_monitor_added(&monitor).await;
 				self.monitors.insert(monitor.id, monitor);
 			}
 			RenderEvt::MonitorOffline { monitor_id } => {
+				let _span = profiler::span("server.render_monitor_offline");
 				tracing::info!(%monitor_id, "renderer reports monitor offline");
 				if let Some(monitor) = self.monitors.remove(&monitor_id) {
 					self.broadcast_monitor_removed(&monitor).await;
 				}
 			}
 			RenderEvt::FatalError { reason } => {
+				let _span = profiler::span("server.render_fatal_error");
 				tracing::error!(?reason, "renderer fatal error");
 				// TODO: Shutdown server
 			}
 			RenderEvt::PageFlip { monitors } => {
+				let _span = profiler::span("server.render_page_flip");
+				profiler::record("server.page_flip");
 				if monitors.is_empty() {
 					return;
 				}
 				let Some(active_session) = self.current_session else {
-					tracing::trace!("page flip ignored: no active session");
 					return;
 				};
 				let Some((_id, client)) = self

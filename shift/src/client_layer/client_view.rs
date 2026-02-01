@@ -1,5 +1,7 @@
 use std::{rc::Rc, sync::Arc};
 
+use shift_profiler as profiler;
+
 use crate::{
 	auth::{self, Token},
 	client_layer::client::{Client, ClientId},
@@ -77,6 +79,7 @@ impl ClientView {
 		!self.channels.0.is_closed() || !self.channels.0.is_empty()
 	}
 	pub async fn notify_auth_error(&self, reason: auth::error::Error) -> bool {
+		let _span = profiler::span("server2client.auth_error.send");
 		self
 			.channels
 			.1
@@ -85,6 +88,7 @@ impl ClientView {
 			.is_ok()
 	}
 	pub async fn notify_auth_success(&mut self, session: &Arc<Session>) -> bool {
+		let _span = profiler::span("server2client.auth_success.send");
 		self.session_id = Some(session.id());
 		self
 			.channels
@@ -94,6 +98,7 @@ impl ClientView {
 			.is_ok()
 	}
 	pub async fn notify_session_created(&mut self, token: Token, session: PendingSession) -> bool {
+		let _span = profiler::span("server2client.session_created.send");
 		self
 			.channels
 			.1
@@ -108,6 +113,7 @@ impl ClientView {
 		error: Option<Arc<str>>,
 		shutdown: bool,
 	) -> bool {
+		let _span = profiler::span("server2client.error.send");
 		self
 			.channels
 			.1
@@ -125,6 +131,7 @@ impl ClientView {
 	}
 
 	pub async fn notify_frame_done(&mut self, monitors: Vec<MonitorId>) -> bool {
+		let _span = profiler::span("server2client.frame_done.send");
 		self
 			.channels
 			.1
@@ -134,6 +141,7 @@ impl ClientView {
 	}
 
 	pub async fn notify_monitor_added(&mut self, monitor: Monitor) -> bool {
+		let _span = profiler::span("server2client.monitor_added.send");
 		self
 			.channels
 			.1
@@ -143,6 +151,7 @@ impl ClientView {
 	}
 
 	pub async fn notify_monitor_removed(&mut self, monitor_id: MonitorId, name: Arc<str>) -> bool {
+		let _span = profiler::span("server2client.monitor_removed.send");
 		self
 			.channels
 			.1

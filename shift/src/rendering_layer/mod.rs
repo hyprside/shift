@@ -24,6 +24,7 @@ use crate::{
 };
 use channels::RenderingEnd;
 use dmabuf_import::{DmaBufTexture, ImportParams as DmaBufImportParams, SkiaDmaBufTexture};
+use shift_profiler as profiler;
 // -----------------------------
 // Errors
 // -----------------------------
@@ -234,6 +235,9 @@ impl RenderingLayer {
 		self.known_monitors = current.into_iter().map(|m| (m.id, m)).collect();
 
 		'e: loop {
+			profiler::record("render.loop");
+			profiler::report_if_due();
+			let _loop_span = profiler::span("render.loop");
 			// Mantém as surfaces a seguir ao tamanho real do monitor
 			let monitor_ids: Vec<MonitorId> = self.drm.monitors().map(|mon| mon.context().id).collect();
 			let current_session = self.current_session;
@@ -243,7 +247,9 @@ impl RenderingLayer {
 				}
 			}
 			for mon in self.drm.monitors_mut() {
+				let _mon_span = profiler::span("render.monitor");
 				if mon.can_render() && mon.make_current().is_ok() {
+					let _draw_span = profiler::span("render.monitor.draw");
 					unsafe{mon.gl().Clear(COLOR_BUFFER_BIT | DEPTH_BUFFER_BIT); };
 
 					let monitor_id = mon.context().id;
@@ -275,10 +281,13 @@ impl RenderingLayer {
 					context.flush();
 				}
 			}
+			let _swap_span = profiler::span("render.swap_buffers");
 			self.drm.swap_buffers()?;
+			profiler::record("render.swap_buffers");
 			'l: loop {
 				tokio::select! {
 					cmd = command_rx.recv() => {
+						let _cmd_span = profiler::span("render.command.recv");
 						if let Some(cmd) = cmd {
 							if !self.handle_command(cmd).await? {
 								break 'e;
@@ -289,6 +298,7 @@ impl RenderingLayer {
 						}
 					}
 					result = self.drm.poll_events_async() => {
+						let _poll_span = profiler::span("render.poll_events");
 						result?;
 						self.on_after_poll_events().await;
 						break 'l;
@@ -300,6 +310,8 @@ impl RenderingLayer {
 		Ok(())
 	}
 	async fn on_after_poll_events(&mut self) {
+		let _span = profiler::span("render.on_after_poll_events");
+		profiler::record("render.page_flip");
 		let page_flipped_monitors = self
 			.drm
 			.monitors()
@@ -326,6 +338,7 @@ impl RenderingLayer {
 	}
 
 	async fn sync_monitors(&mut self) {
+		let _span = profiler::span("render.sync_monitors");
 		let current_list = self.collect_monitors();
 		let mut current_map = HashMap::new();
 		for monitor in current_list {
@@ -441,6 +454,7 @@ impl RenderingLayer {
 
 impl RenderingLayer {
 	async fn handle_command(&mut self, cmd: RenderCmd) -> Result<bool, RenderError> {
+		let _span = profiler::span("render.handle_command");
 		match cmd {
 			RenderCmd::Shutdown => {
 				warn!("received shutdown request from server");
@@ -451,18 +465,22 @@ impl RenderingLayer {
 				dma_bufs,
 				session_id,
 			} => {
+				let _span = profiler::span("render.handle_framebuffer_link");
 				self.import_framebuffers(payload, dma_bufs, session_id);
 			}
 			RenderCmd::SetActiveSession { session_id } => {
+				let _span = profiler::span("render.handle_set_active_session");
 				self.current_session = session_id;
 			}
 			RenderCmd::SessionRemoved { session_id } => {
+				let _span = profiler::span("render.handle_session_removed");
 				self.cleanup_session_slots(session_id);
 				if self.current_session == Some(session_id) {
 					self.current_session = None;
 				}
 			}
 			RenderCmd::SwapBuffers { monitor_id, buffer, session_id } => {
+				let _span = profiler::span("render.handle_swap_buffers");
 				let slot = BufferSlot::from(buffer);
 				self
 					.monitor_state
@@ -476,6 +494,7 @@ impl RenderingLayer {
 	}
 
 	async fn emit_event(&self, event: RenderEvt) {
+		let _span = profiler::span("render.emit_event");
 		if let Err(e) = self.event_tx.send(event).await {
 			warn!("failed to send renderer event to server: {e}");
 		}

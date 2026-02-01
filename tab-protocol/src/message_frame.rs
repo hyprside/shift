@@ -5,7 +5,8 @@ use std::collections::VecDeque;
 use std::io::{ErrorKind, IoSlice, IoSliceMut};
 use std::os::fd::{AsRawFd, RawFd};
 
-use crate::{HelloPayload, MessageHeader, PROTOCOL_VERSION, ProtocolError};
+use crate::{HelloPayload, MessageHeader, PROTOCOL_VERSION, ProtocolError, TabMessage};
+use shift_profiler as profiler;
 
 /// Raw framed Tab message: header line + payload line (strings) plus optional FDs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +85,28 @@ impl TabMessageFrameReader {
 				def => Ok(def),
 			}) {
 				break result?;
+			}
+		}
+	}
+
+	#[cfg(feature = "async")]
+	pub async fn read_message_from_async_fd<T: AsRawFd>(
+		&mut self,
+		fd: &tokio::io::unix::AsyncFd<T>,
+	) -> Result<TabMessage, ProtocolError> {
+		loop {
+			if let Some(frame) = self.pop_ready() {
+				return TabMessage::try_from(frame);
+			}
+			let mut guard = fd.readable().await?;
+			if let Ok(result) = guard.try_io(|_| match self.read_framed(fd.get_ref()) {
+				Err(ProtocolError::WouldBlock) => Err(would_block_err()),
+				def => Ok(def),
+			}) {
+				let frame = result??;
+				let message = TabMessage::try_from(frame)?;
+				profiler::record("tab_protocol.read_message");
+				return Ok(message);
 			}
 		}
 	}

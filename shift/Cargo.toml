@@ -4,11 +4,12 @@ version = { workspace = true }
 edition = { workspace = true }
 
 [dependencies]
-easydrm = { workspace = true }
+easydrm = { path = "../../easydrm" }
 tokio.workspace = true
 tab-protocol = { path = "../tab-protocol" }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+shift-profiler = { workspace = true }
 nix = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }

@@ -246,7 +246,6 @@ dependencies = [
 [[package]]
 name = "easydrm"
 version = "0.3.0"
-source = "git+https://github.com/everything-os/easydrm?branch=main#f775286160f78ae5f90de7ee390986c3b608eaaf"
 dependencies = [
  "drm",
  "drm-sys",
@@ -1088,6 +1087,7 @@ dependencies = [
  "paste",
  "rand",
  "serde",
+ "shift-profiler",
  "skia-safe",
  "subtle",
  "tab-protocol",
@@ -1095,6 +1095,13 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "shift-profiler"
+version = "0.1.0"
+dependencies = [
+ "tracing",
 ]
 
 [[package]]
@@ -1179,6 +1186,7 @@ dependencies = [
  "libloading",
  "nix 0.29.0",
  "serde_json",
+ "shift-profiler",
  "tab-protocol",
  "thiserror 1.0.69",
  "tracing",
@@ -1193,6 +1201,7 @@ dependencies = [
  "nix 0.29.0",
  "serde",
  "serde_json",
+ "shift-profiler",
  "thiserror 1.0.69",
  "tokio",
 ]

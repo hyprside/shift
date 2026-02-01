@@ -13,6 +13,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 const-str = "0.5"
 tokio = {workspace = true, optional = true}
+shift-profiler = { workspace = true }
 
 [features]
 default = ["async"]

@@ -17,8 +17,7 @@ mod sessions;
 async fn main() {
 	// ---- logging/tracing ----
 	tracing_subscriber::fmt()
-		.with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "trace".to_string()))
-		.with_target(false)
+		.with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "debug".to_string()))
 		.init();
 
 	// ---- socket path ----
@@ -38,7 +37,8 @@ async fn main() {
 			return;
 		}
 	};
-	server.add_initial_session();
+	let token = server.add_initial_session().to_base64url();
+	std::fs::write("/home/tiago/Desktop/shift/shift/token", token).unwrap();
 	tracing::info!("starting ShiftServer on {:?}", socket_path);
 
 	// ---- create rendering ----

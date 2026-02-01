@@ -10,6 +10,7 @@ use tab_protocol::{
 	TabMessageFrameReader, message_header,
 };
 use tokio::{io::unix::AsyncFd, task::JoinHandle};
+use shift_profiler as profiler;
 
 use crate::{
 	auth::Token,
@@ -54,6 +55,7 @@ impl Client {
 	}
 	#[tracing::instrument(level = "error", skip(self), fields(client.id = self.id().to_string()))]
 	async fn send_error(&self, code: &str, error: Option<impl Display + Debug>) {
+		let _span = profiler::span("client.send_error");
 		tracing::warn!("sending error to the client");
 		let tab_message = TabMessageFrame::json(
 			message_header::ERROR,
@@ -69,6 +71,7 @@ impl Client {
 	}
 	#[tracing::instrument(skip(self), fields(client.id = self.id().to_string()))]
 	async fn send_auth_error(&mut self, cause: impl Display + Debug) {
+		let _span = profiler::span("client.send_auth_error");
 		let tab_message = TabMessageFrame::json(
 			message_header::AUTH_ERROR,
 			AuthErrorPayload {
@@ -84,11 +87,13 @@ impl Client {
 
 	#[tracing::instrument(skip(self), fields(client.id = self.id().to_string()))]
 	async fn handle_unknown_msg(&mut self, message_name: impl Display + Debug) {
+		let _span = profiler::span("client.handle_unknown_msg");
 		self.send_error("unknown_message", Some(message_name)).await;
 		self.schedule_client_shutdown().await;
 	}
 	#[tracing::instrument(skip(self), fields(client.id = self.id().to_string()))]
 	async fn handle_packet(&mut self, tab_message: TabMessage) {
+		let _span = profiler::span("client.handle_packet");
 		macro_rules! check_admin {
 			($action:literal) => {
 				if !self
@@ -230,6 +235,7 @@ impl Client {
 	}
 	#[tracing::instrument(skip(self), fields(client.id = self.id().to_string()))]
 	async fn handle_server_layer_msg(&mut self, s2c_message: Option<S2CMsg>) {
+		let _span = profiler::span("client.handle_server_layer_msg");
 		let Some(s2c_message) = s2c_message else {
 			self.schedule_client_shutdown().await;
 			return;
@@ -264,6 +270,7 @@ impl Client {
 					},
 				);
 				self.connected_session = Some(session);
+				let _send_span = profiler::span("client.send.auth_ok");
 				let send_result = auth_ok.send_frame_to_async_fd(&self.socket).await;
 
 				if let Err(e) = send_result {
@@ -277,6 +284,7 @@ impl Client {
 					?token,
 					"server says it created a new session sucessfully"
 				);
+				let _send_span = profiler::span("client.send.session_created");
 				let send_result = TabMessageFrame::json(
 					message_header::SESSION_CREATED,
 					SessionCreatedPayload {
@@ -308,6 +316,7 @@ impl Client {
 			}
 			S2CMsg::FrameDone { monitors } => {
 				for monitor_id in monitors {
+					let _send_span = profiler::span("client.send.frame_done");
 					let send_result =
 						TabMessageFrame::raw(message_header::FRAME_DONE, monitor_id.to_string())
 						.send_frame_to_async_fd(&self.socket)
@@ -322,6 +331,7 @@ impl Client {
 				let payload = MonitorAddedPayload {
 					monitor: monitor.to_protocol_info(),
 				};
+				let _send_span = profiler::span("client.send.monitor_added");
 				if let Err(e) = TabMessageFrame::json(message_header::MONITOR_ADDED, payload)
 					.send_frame_to_async_fd(&self.socket)
 					.await
@@ -334,6 +344,7 @@ impl Client {
 					monitor_id: monitor_id.to_string(),
 					name: name.to_string(),
 				};
+				let _send_span = profiler::span("client.send.monitor_removed");
 				if let Err(e) = TabMessageFrame::json(message_header::MONITOR_REMOVED, payload)
 					.send_frame_to_async_fd(&self.socket)
 					.await
@@ -357,14 +368,20 @@ impl Client {
 	async fn run(mut self) {
 		loop {
 			tokio::select! {
-					read_frame_result = self.frame_reader.read_frame_from_async_fd(&self.socket) => match read_frame_result.and_then(TabMessage::try_from) {
-							Ok(packet) => self.handle_packet(packet).await,
-							Err(e) => {
-									self.send_error("protocol_violation", Some(e)).await;
-									self.schedule_client_shutdown().await;
+					read_frame_result = self.frame_reader.read_frame_from_async_fd(&self.socket) => {
+							let _span = profiler::span("client.read_frame");
+							match read_frame_result.and_then(TabMessage::try_from) {
+									Ok(packet) => self.handle_packet(packet).await,
+									Err(e) => {
+											self.send_error("protocol_violation", Some(e)).await;
+											self.schedule_client_shutdown().await;
+									}
 							}
 					},
-					server_layer_message = self.channel_client_end.from_server().recv() => self.handle_server_layer_msg(server_layer_message).await
+					server_layer_message = self.channel_client_end.from_server().recv() => {
+							let _span = profiler::span("client.recv_from_server");
+							self.handle_server_layer_msg(server_layer_message).await
+					}
 			}
 			if self.shutdown {
 				return;

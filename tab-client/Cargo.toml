@@ -15,6 +15,7 @@ serde_json = { workspace = true }
 libloading = "0.8.9"
 nix = { workspace = true, features = ["poll", "fs"] }
 gbm = { version = "0.18", default-features = false, features = ["import-egl"] }
+shift-profiler = { workspace = true }
 
 [dev-dependencies]
 tracing = { workspace = true }
