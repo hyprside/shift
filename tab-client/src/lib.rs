@@ -20,12 +20,13 @@ use std::os::{
 	unix::net::UnixStream,
 };
 use std::sync::Arc;
+use std::time::Duration;
 
 use tab_protocol::message_frame::{TabMessageFrame, TabMessageFrameReader};
 use tab_protocol::message_header;
 use tab_protocol::{
-	AuthErrorPayload, AuthOkPayload, AuthPayload, BufferIndex, FrameDonePayload, MonitorInfo,
-	SessionInfo, TabMessage,
+	AuthErrorPayload, AuthOkPayload, AuthPayload, BufferIndex, BufferReleasePayload,
+	BufferRequestAckPayload, MonitorInfo, SessionInfo, TabMessage,
 };
 
 use crate::gbm_allocator::GbmAllocator;
@@ -115,21 +116,26 @@ impl TabClient {
 	pub fn framebuffer_link(&self, swapchain: &TabSwapchain) -> Result<(), TabClientError> {
 		let payload = swapchain.framebuffer_link_payload();
 		let mut frame = TabMessageFrame::json(message_header::FRAMEBUFFER_LINK, payload);
-		let fds = swapchain.export_fds()?;
-		frame.fds = fds.iter().map(|fd| fd.as_raw_fd()).collect();
+		let fds = swapchain.export_fds();
+		frame.fds = Vec::from(fds);
 		frame.encode_and_send(&self.socket)?;
-		drop(fds);
 		Ok(())
 	}
 
-	pub fn swap_buffers(&self, monitor_id: &str, buffer: BufferIndex) -> Result<(), TabClientError> {
+	pub fn request_buffer(
+		&mut self,
+		monitor_id: &str,
+		buffer: BufferIndex,
+		acquire_fence: Option<RawFd>,
+	) -> Result<(), TabClientError> {
 		let payload = format!("{monitor_id} {}", buffer as u8);
 		let frame = TabMessageFrame {
-			header: message_header::SWAP_BUFFERS.into(),
+			header: message_header::BUFFER_REQUEST.into(),
 			payload: Some(payload),
-			fds: Vec::new(),
+			fds: acquire_fence.map_or_else(Vec::new, |fd| vec![fd]),
 		};
 		frame.encode_and_send(&self.socket)?;
+		self.wait_for_buffer_request_ack(monitor_id, buffer)?;
 		Ok(())
 	}
 
@@ -198,8 +204,8 @@ impl TabClient {
 			TabMessage::MonitorRemoved(payload) => {
 				self.handle_monitor_removed(payload.monitor_id);
 			}
-			TabMessage::FrameDone(payload) => {
-				self.handle_frame_done(payload);
+			TabMessage::BufferRelease(payload) => {
+				self.handle_buffer_release(payload);
 			}
 			_ => {}
 		}
@@ -223,12 +229,49 @@ impl TabClient {
 		}
 	}
 
-	fn handle_frame_done(&mut self, payload: FrameDonePayload) {
-		let event = RenderEvent::FrameDone {
+	fn handle_buffer_release(&mut self, payload: BufferReleasePayload) {
+		let event = RenderEvent::BufferReleased {
 			monitor_id: payload.monitor_id,
+			buffer: payload.buffer,
 		};
 		for listener in &self.render_listeners {
 			listener(&event);
+		}
+	}
+
+	fn wait_for_buffer_request_ack(
+		&mut self,
+		monitor_id: &str,
+		buffer: BufferIndex,
+	) -> Result<(), TabClientError> {
+		loop {
+			match self.reader.read_framed(&self.socket) {
+				Ok(frame) => {
+					let message = TabMessage::try_from(frame)?;
+					match message {
+						TabMessage::BufferRequestAck(BufferRequestAckPayload {
+							monitor_id: ack_monitor,
+							buffer: ack_buffer,
+						}) => {
+							if ack_monitor == monitor_id && ack_buffer == buffer {
+								return Ok(());
+							}
+						}
+						TabMessage::Error(err) => {
+							let details = err
+								.message
+								.map(|m| format!("{}: {m}", err.code))
+								.unwrap_or(err.code);
+							return Err(TabClientError::Server(details));
+						}
+						other => self.handle_message(other)?,
+					}
+				}
+				Err(tab_protocol::ProtocolError::WouldBlock) => {
+					std::thread::sleep(Duration::from_micros(50));
+				}
+				Err(other) => return Err(other.into()),
+			}
 		}
 	}
 }

@@ -22,7 +22,8 @@ pub enum RenderCmd {
 	SwapBuffers {
 		monitor_id: MonitorId,
 		buffer: BufferIndex,
-		session_id: SessionId
+		session_id: SessionId,
+		acquire_fence: Option<OwnedFd>,
 	},
 }
 

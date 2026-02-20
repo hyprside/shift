@@ -1,4 +1,5 @@
 use crate::MonitorState;
+use tab_protocol::BufferIndex;
 
 /// Monitor lifecycle event emitted to listeners.
 #[derive(Debug, Clone)]
@@ -10,5 +11,8 @@ pub enum MonitorEvent {
 /// Rendering-related notifications.
 #[derive(Debug, Clone)]
 pub enum RenderEvent {
-	FrameDone { monitor_id: String },
+	BufferReleased {
+		monitor_id: String,
+		buffer: BufferIndex,
+	},
 }

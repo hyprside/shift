@@ -4,7 +4,6 @@ use std::{
 	collections::{HashMap, VecDeque},
 	env,
 	ffi::{CStr, CString},
-	os::fd::IntoRawFd,
 	os::raw::{c_char, c_int},
 	ptr,
 	sync::{Arc, Mutex},
@@ -32,7 +31,15 @@ pub struct TabFrameTarget {
 	pub texture: u32,
 	pub width: i32,
 	pub height: i32,
+	pub buffer_index: u32,
 	pub dmabuf: TabDmabuf,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct TabBufferRelease {
+	pub monitor_id: *mut c_char,
+	pub buffer_index: u32,
 }
 
 #[repr(C)]
@@ -56,7 +63,7 @@ pub enum TabAcquireResult {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub enum TabEventType {
-	TAB_EVENT_FRAME_DONE = 0,
+	TAB_EVENT_BUFFER_RELEASED = 0,
 	TAB_EVENT_MONITOR_ADDED = 1,
 	TAB_EVENT_MONITOR_REMOVED = 2,
 	TAB_EVENT_SESSION_STATE = 3,
@@ -99,7 +106,7 @@ pub struct TabEvent {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub union TabEventData {
-	pub frame_done: *mut c_char,
+	pub buffer_released: TabBufferRelease,
 	pub monitor_added: TabMonitorInfo,
 	pub monitor_removed: *mut c_char,
 	pub session_state: TabSessionInfo,
@@ -426,7 +433,7 @@ struct MonitorEntry {
 }
 
 enum PendingEvent {
-	FrameDone(String),
+	BufferReleased(String, BufferIndex),
 	MonitorAdded(MonitorState),
 	MonitorRemoved(String),
 }
@@ -458,7 +465,9 @@ impl TabClientHandle {
 			client.on_render_event(move |evt| {
 				let mut guard = q.lock().unwrap();
 				match evt {
-					RenderEvent::FrameDone { monitor_id } => guard.push_back(PendingEvent::FrameDone(monitor_id.clone())),
+					RenderEvent::BufferReleased { monitor_id, buffer } => {
+						guard.push_back(PendingEvent::BufferReleased(monitor_id.clone(), *buffer))
+					}
 				}
 			});
 		}
@@ -755,9 +764,15 @@ pub unsafe extern "C" fn tab_client_next_event(
 			return false;
 		};
 		match evt {
-			PendingEvent::FrameDone(monitor_id) => {
-				(*event).event_type = TabEventType::TAB_EVENT_FRAME_DONE;
-				(*event).data.frame_done = dup_string(&monitor_id);
+			PendingEvent::BufferReleased(monitor_id, buffer) => {
+				if let Some(entry) = handle.monitors.get_mut(&monitor_id) {
+					entry.swapchain.mark_released(buffer);
+				}
+				(*event).event_type = TabEventType::TAB_EVENT_BUFFER_RELEASED;
+				(*event).data.buffer_released = TabBufferRelease {
+					monitor_id: dup_string(&monitor_id),
+					buffer_index: buffer as u32,
+				};
 				true
 			}
 			PendingEvent::MonitorRemoved(monitor_id) => {
@@ -789,10 +804,10 @@ pub unsafe extern "C" fn tab_client_free_event_strings(event: *mut TabEvent) {
 			return;
 		}
 		match (*event).event_type {
-			TabEventType::TAB_EVENT_FRAME_DONE => {
-				if !(*event).data.frame_done.is_null() {
-					drop(CString::from_raw((*event).data.frame_done));
-					(*event).data.frame_done = ptr::null_mut();
+			TabEventType::TAB_EVENT_BUFFER_RELEASED => {
+				if !(*event).data.buffer_released.monitor_id.is_null() {
+					drop(CString::from_raw((*event).data.buffer_released.monitor_id));
+					(*event).data.buffer_released.monitor_id = ptr::null_mut();
 				}
 			}
 			TabEventType::TAB_EVENT_MONITOR_REMOVED => {
@@ -829,14 +844,10 @@ pub unsafe extern "C" fn tab_client_acquire_frame(
 			Some(entry) => entry,
 			None => return TabAcquireResult::TAB_ACQUIRE_ERROR,
 		};
-		let (buffer, index) = entry.swapchain.acquire_next();
-		let fd = match buffer.duplicate_fd() {
-			Ok(fd) => fd.into_raw_fd(),
-			Err(err) => {
-				handle.record_error(err);
-				return TabAcquireResult::TAB_ACQUIRE_ERROR;
-			}
+		let Some((buffer, index)) = entry.swapchain.acquire_next() else {
+			return TabAcquireResult::TAB_ACQUIRE_NO_BUFFERS;
 		};
+		let fd = buffer.fd();
 		entry.pending = Some(index);
 		if target.is_null() {
 			return TabAcquireResult::TAB_ACQUIRE_ERROR;
@@ -845,6 +856,7 @@ pub unsafe extern "C" fn tab_client_acquire_frame(
 		(*target).texture = 0;
 		(*target).width = buffer.width();
 		(*target).height = buffer.height();
+		(*target).buffer_index = index as u32;
 		(*target).dmabuf = TabDmabuf {
 			fd,
 			stride: buffer.stride(),
@@ -856,9 +868,10 @@ pub unsafe extern "C" fn tab_client_acquire_frame(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn tab_client_swap_buffers(
+pub unsafe extern "C" fn tab_client_request_buffer(
 	handle: *mut TabClientHandle,
 	monitor_id: *const c_char,
+	acquire_fence_fd: c_int,
 ) -> bool {
 	unsafe {
 		let handle = match handle.as_mut() {
@@ -877,10 +890,17 @@ pub unsafe extern "C" fn tab_client_swap_buffers(
 			Some(idx) => idx,
 			None => return false,
 		};
-		if let Err(err) = handle.client.swap_buffers(&id, buffer) {
+		let acquire_fence = if acquire_fence_fd >= 0 {
+			Some(acquire_fence_fd)
+		} else {
+			None
+		};
+		if let Err(err) = handle.client.request_buffer(&id, buffer, acquire_fence) {
+			entry.swapchain.rollback();
 			handle.record_error(err);
 			return false;
 		}
+		entry.swapchain.mark_busy(buffer);
 		true
 	}
 }

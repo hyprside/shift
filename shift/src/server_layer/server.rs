@@ -1,4 +1,4 @@
-use std::{collections::{HashMap, HashSet}, fs::Permissions, future::pending, io, os::unix::fs::PermissionsExt, path::Path, sync::Arc};
+use std::{collections::{HashMap, HashSet}, fs::Permissions, future::pending, io, os::unix::fs::PermissionsExt, path::{Path, PathBuf}, process::Command, sync::Arc};
 
 use futures::future::select_all;
 use tab_protocol::TabMessageFrame;
@@ -20,12 +20,34 @@ use crate::{
 	comms::{
 		client2server::C2SMsg,
 		render2server::{RenderEvt, RenderEvtRx},
+		server2client::BufferRelease,
 		server2render::{RenderCmd, RenderCmdTx},
 	},
 	monitor::{Monitor, MonitorId},
 	rendering_layer::channels::ServerEnd as RenderServerChannels,
 	sessions::{PendingSession, Role, Session, SessionId},
 };
+
+#[derive(Debug, Clone, Copy)]
+struct PendingFlip {
+	session_id: SessionId,
+	monitor_id: MonitorId,
+	buffer: tab_protocol::BufferIndex,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingBufferRequest {
+	client_id: ClientId,
+	session_id: SessionId,
+	monitor_id: MonitorId,
+	buffer: tab_protocol::BufferIndex,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BufferOwner {
+	Client,
+	Shift,
+}
 struct ConnectedClient {
 	client_view: ClientView,
 	join_handle: TokioJoinHandle<()>,
@@ -44,7 +66,10 @@ pub struct ShiftServer {
 	render_commands: RenderCmdTx,
 	render_events: RenderEvtRx,
 	monitors: HashMap<MonitorId, Monitor>,
-	waiting_flip: Vec<(SessionId, MonitorId)>,
+	pending_buffer_requests: Vec<PendingBufferRequest>,
+	waiting_flip: Vec<PendingFlip>,
+	front_buffers: HashMap<(SessionId, MonitorId), tab_protocol::BufferIndex>,
+	buffer_ownership: HashMap<(SessionId, MonitorId, tab_protocol::BufferIndex), BufferOwner>,
 	swap_buffers_received: u64,
 	frame_done_emitted: u64,
 }
@@ -72,7 +97,10 @@ impl ShiftServer {
 			render_commands,
 			render_events,
 			monitors: Default::default(),
+			pending_buffer_requests: Default::default(),
 			waiting_flip: Default::default(),
+			front_buffers: Default::default(),
+			buffer_ownership: Default::default(),
 			swap_buffers_received: 0,
 			frame_done_emitted: 0,
 		})
@@ -82,6 +110,18 @@ impl ShiftServer {
 		let (token, session) = PendingSession::admin(Some("Admin".into()));
 		let id = session.id();
 		self.pending_sessions.insert(token.clone(), session);
+
+		let admin_launch_cmd = std::env::var("ADMIN_LAUNCH_CMD").ok();
+		let shell = std::env::var("SHELL")
+			.unwrap_or_else(|_| "bash".to_string());
+		if let Some(admin_launch_cmd) = admin_launch_cmd {
+			let mut cmd = Command::new(shell);
+			cmd.args(["-c", &admin_launch_cmd]);
+			cmd.env("SHIFT_SESSION_TOKEN", token.to_string());
+			if let Err(e) = cmd.spawn() {
+				panic!("Failed to start admin session process: {e}");
+			}
+		}
 		tracing::info!(?token, %id, "added initial admin session");
 		token
 	}
@@ -212,7 +252,11 @@ impl ShiftServer {
 					self.disconnect_client(client_id).await;
 				}
 			}
-			C2SMsg::SwapBuffers { monitor_id, buffer } => {
+			C2SMsg::BufferRequest {
+				monitor_id,
+				buffer,
+				acquire_fence,
+			} => {
 
 				let Some(connected_client) = self.connected_clients.get_mut(&client_id) else {
 					tracing::warn!("tried handling message from a non-existing client");
@@ -230,9 +274,46 @@ impl ShiftServer {
 						.await;
 					return;
 				};
+				let owner_key = (client_session.id(), monitor_id, buffer);
+				let current_owner = self
+					.buffer_ownership
+					.get(&owner_key)
+					.copied()
+					.unwrap_or(BufferOwner::Client);
+				if current_owner != BufferOwner::Client {
+					connected_client
+						.client_view
+						.notify_error(
+							"ownership_violation".into(),
+							Some("requested buffer is not client-owned".into()),
+							false,
+						)
+						.await;
+					return;
+				}
+				if self.pending_buffer_requests.iter().any(|pending| {
+					pending.session_id == client_session.id()
+						&& pending.monitor_id == monitor_id
+						&& pending.buffer == buffer
+				}) {
+					connected_client
+						.client_view
+						.notify_error(
+							"buffer_request_inflight".into(),
+							Some("buffer request already pending".into()),
+							false,
+						)
+						.await;
+					return;
+				}
 				if let Err(e) = self
 					.render_commands
-					.send(RenderCmd::SwapBuffers { monitor_id, buffer, session_id: client_session.id() })
+					.send(RenderCmd::SwapBuffers {
+						monitor_id,
+						buffer,
+						session_id: client_session.id(),
+						acquire_fence,
+					})
 					.await
 				{
 					tracing::error!("failed to forward SwapBuffers to renderer: {e}");
@@ -242,11 +323,16 @@ impl ShiftServer {
 						client.client_view.notify_error(code, detail, true).await;
 					}
 				} else {
-					self.waiting_flip.push((client_session.id(), monitor_id));
-					self.swap_buffers_received = self.swap_buffers_received.saturating_add(1);
+					self.pending_buffer_requests.push(PendingBufferRequest {
+						client_id,
+						session_id: client_session.id(),
+						monitor_id,
+						buffer,
+					});
 				}
 			}
 			C2SMsg::FramebufferLink { payload, dma_bufs } => {
+				let monitor_id_raw = payload.monitor_id.clone();
 				let session_id = {
 					let Some(client) = self.connected_clients.get_mut(&client_id) else {
 						tracing::warn!("tried handling message from a non-existing client");
@@ -276,6 +362,22 @@ impl ShiftServer {
 					if let Some(client) = self.connected_clients.get_mut(&client_id) {
 						client.client_view.notify_error(code, detail, true).await;
 					}
+				} else {
+					let Ok(monitor_id) = monitor_id_raw.parse::<MonitorId>() else {
+						return;
+					};
+					self.waiting_flip
+						.retain(|pending| !(pending.session_id == session_id && pending.monitor_id == monitor_id));
+					self.pending_buffer_requests.retain(|pending| {
+						!(pending.session_id == session_id && pending.monitor_id == monitor_id)
+					});
+					self.front_buffers.remove(&(session_id, monitor_id));
+					self
+						.buffer_ownership
+						.insert((session_id, monitor_id, tab_protocol::BufferIndex::Zero), BufferOwner::Client);
+					self
+						.buffer_ownership
+						.insert((session_id, monitor_id, tab_protocol::BufferIndex::One), BufferOwner::Client);
 				}
 			}
 		}
@@ -294,6 +396,78 @@ impl ShiftServer {
 				tracing::info!(%monitor_id, "renderer reports monitor offline");
 				if let Some(monitor) = self.monitors.remove(&monitor_id) {
 					self.broadcast_monitor_removed(&monitor).await;
+				}
+				self.waiting_flip.retain(|pending| pending.monitor_id != monitor_id);
+				self
+					.pending_buffer_requests
+					.retain(|pending| pending.monitor_id != monitor_id);
+				self.front_buffers.retain(|(_, mon), _| *mon != monitor_id);
+				self
+					.buffer_ownership
+					.retain(|(_, mon, _), _| *mon != monitor_id);
+			}
+			RenderEvt::BufferRequestAck {
+				session_id,
+				monitor_id,
+				buffer,
+			} => {
+				let Some(pos) = self.pending_buffer_requests.iter().position(|pending| {
+					pending.session_id == session_id
+						&& pending.monitor_id == monitor_id
+						&& pending.buffer == buffer
+				}) else {
+					tracing::warn!(%session_id, %monitor_id, buffer = buffer as u8, "renderer acked unknown pending request");
+					return;
+				};
+				let pending = self.pending_buffer_requests.remove(pos);
+				self
+					.buffer_ownership
+					.insert((session_id, monitor_id, buffer), BufferOwner::Shift);
+				self.waiting_flip.push(PendingFlip {
+					session_id,
+					monitor_id,
+					buffer,
+				});
+				self.swap_buffers_received = self.swap_buffers_received.saturating_add(1);
+
+				let mut should_disconnect = false;
+				if let Some(client) = self.connected_clients.get_mut(&pending.client_id) {
+					if !client
+						.client_view
+						.notify_buffer_request_ack(monitor_id, buffer)
+						.await
+					{
+						should_disconnect = true;
+					}
+				}
+				if should_disconnect {
+					self.disconnect_client(pending.client_id).await;
+				}
+			}
+			RenderEvt::BufferRequestRejected {
+				session_id,
+				monitor_id,
+				buffer,
+				reason,
+			} => {
+				let Some(pos) = self.pending_buffer_requests.iter().position(|pending| {
+					pending.session_id == session_id
+						&& pending.monitor_id == monitor_id
+						&& pending.buffer == buffer
+				}) else {
+					tracing::warn!(%session_id, %monitor_id, buffer = buffer as u8, %reason, "renderer rejected unknown pending request");
+					return;
+				};
+				let pending = self.pending_buffer_requests.remove(pos);
+				if let Some(client) = self.connected_clients.get_mut(&pending.client_id) {
+					client
+						.client_view
+						.notify_error(
+							"buffer_request_rejected".into(),
+							Some(reason),
+							false,
+						)
+						.await;
 				}
 			}
 			RenderEvt::FatalError { reason } => {
@@ -316,29 +490,39 @@ impl ShiftServer {
 					tracing::debug!(%active_session, "page flip ignored: no client bound to active session");
 					return;
 				};
-				let mut flipped_and_waited_monitors = Vec::with_capacity(monitors.len());
-				// Only acknowledge one pending swap per monitor per page flip.
+				let mut buffer_release = Vec::with_capacity(monitors.len());
+				// Acknowledge one pending swap per monitor per page flip and release previous front buffer.
 				for monitor in &monitors {
 					if let Some(pos) = self
 						.waiting_flip
 						.iter()
-						.position(|(s, m)| s == &active_session && m == monitor)
+						.position(|pending| pending.session_id == active_session && pending.monitor_id == *monitor)
 					{
-						self.waiting_flip.remove(pos);
-						flipped_and_waited_monitors.push(*monitor);
+						let pending = self.waiting_flip.remove(pos);
+						let key = (active_session, *monitor);
+						if let Some(released) = self.front_buffers.insert(key, pending.buffer) {
+							self
+								.buffer_ownership
+								.insert((active_session, *monitor, released), BufferOwner::Client);
+							buffer_release.push(BufferRelease {
+								monitor_id: *monitor,
+								buffer: released,
+							});
+						}
 					}
 				}
-				if flipped_and_waited_monitors.is_empty() {
+				if buffer_release.is_empty() {
 					return;
 				}
+				let frame_done_count = buffer_release.len() as u64;
 				if !client
 					.client_view
-					.notify_frame_done(flipped_and_waited_monitors)
+					.notify_buffer_release(buffer_release)
 					.await
 				{
-					tracing::warn!(%active_session, "failed to forward frame_done to client");
+					tracing::warn!(%active_session, "failed to forward buffer_release to client");
 				} else {
-					self.frame_done_emitted = self.frame_done_emitted.saturating_add(1);
+					self.frame_done_emitted = self.frame_done_emitted.saturating_add(frame_done_count);
 				}
 			}
 		}
@@ -438,6 +622,14 @@ impl ShiftServer {
 		};
 		if let Some(session_id) = client.client_view.authenticated_session() {
 			self.active_sessions.remove(&session_id);
+			self
+				.pending_buffer_requests
+				.retain(|pending| pending.client_id != client_id && pending.session_id != session_id);
+			self.waiting_flip.retain(|pending| pending.session_id != session_id);
+			self.front_buffers.retain(|(sess, _), _| *sess != session_id);
+			self
+				.buffer_ownership
+				.retain(|(sess, _, _), _| *sess != session_id);
 			if let Err(e) = self
 				.render_commands
 				.send(RenderCmd::SessionRemoved { session_id })

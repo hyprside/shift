@@ -5,11 +5,12 @@ use std::{
 };
 
 use tab_protocol::{
-	AuthErrorPayload, AuthOkPayload, ErrorPayload, FrameDonePayload, MonitorAddedPayload,
+	AuthErrorPayload, AuthOkPayload, ErrorPayload, MonitorAddedPayload,
 	MonitorRemovedPayload, SessionCreatedPayload, SessionInfo, TabMessage, TabMessageFrame,
 	TabMessageFrameReader, message_header,
 };
 use tokio::{io::unix::AsyncFd, task::JoinHandle};
+use tracing::{Instrument, Span};
 
 use crate::{
 	auth::Token,
@@ -153,7 +154,10 @@ impl Client {
 			TabMessage::SessionSwitch(_session_switch_payload) => {
 				self.handle_unknown_msg("SessionSwitch").await
 			}
-			TabMessage::SwapBuffers { payload } => {
+			TabMessage::BufferRequest {
+				payload,
+				acquire_fence,
+			} => {
 				let monitor_id = payload.monitor_id.parse::<MonitorId>();
 				let monitor_id = match monitor_id {
 					Ok(monitor_id) => monitor_id,
@@ -166,9 +170,10 @@ impl Client {
 							.await;
 					}
 				};
-				send_server_msg!(C2SMsg::SwapBuffers {
+				send_server_msg!(C2SMsg::BufferRequest {
 					monitor_id: monitor_id,
-					buffer: payload.buffer
+					buffer: payload.buffer,
+					acquire_fence,
 				});
 			}
 			TabMessage::SessionCreate(session_create_req) => {
@@ -201,7 +206,12 @@ impl Client {
 			TabMessage::Hello(_hello_payload) => self.handle_unknown_msg("Hello").await,
 			TabMessage::AuthOk(_auth_ok_payload) => self.handle_unknown_msg("AuthOk").await,
 			TabMessage::AuthError(_auth_error_payload) => self.handle_unknown_msg("AuthError").await,
-			TabMessage::FrameDone(_frame_done_payload) => self.handle_unknown_msg("FrameDone").await,
+			TabMessage::BufferRelease(_buffer_release_payload) => {
+				self.handle_unknown_msg("BufferRelease").await
+			}
+			TabMessage::BufferRequestAck(_buffer_request_ack_payload) => {
+				self.handle_unknown_msg("BufferRequestAck").await
+			}
 			TabMessage::InputEvent(_input_event_payload) => self.handle_unknown_msg("InputEvent").await,
 			TabMessage::MonitorAdded(_monitor_added_payload) => {
 				self.handle_unknown_msg("MonitorAdded").await
@@ -306,16 +316,25 @@ impl Client {
 					self.schedule_client_shutdown().await;
 				}
 			}
-			S2CMsg::FrameDone { monitors } => {
-				for monitor_id in monitors {
-					let send_result =
-						TabMessageFrame::raw(message_header::FRAME_DONE, monitor_id.to_string())
+			S2CMsg::BufferRelease { buffers } => {
+				for buffer in buffers {
+					let payload = format!("{} {}", buffer.monitor_id, buffer.buffer as u8);
+					let send_result = TabMessageFrame::raw(message_header::BUFFER_RELEASE, payload)
 						.send_frame_to_async_fd(&self.socket)
 						.await;
 					if let Err(e) = send_result {
-						tracing::warn!(%monitor_id, "failed to send frame_done: {e}");
+						tracing::warn!(monitor_id = %buffer.monitor_id, buffer = buffer.buffer as u8, "failed to send buffer_release: {e}");
 						break;
 					}
+				}
+			}
+			S2CMsg::BufferRequestAck { monitor_id, buffer } => {
+				let payload = format!("{monitor_id} {}", buffer as u8);
+				if let Err(e) = TabMessageFrame::raw(message_header::BUFFER_REQUEST_ACK, payload)
+					.send_frame_to_async_fd(&self.socket)
+					.await
+				{
+					tracing::warn!(%monitor_id, buffer = buffer as u8, "failed to send buffer_request_ack: {e}");
 				}
 			}
 			S2CMsg::MonitorAdded { monitor } => {
@@ -373,7 +392,7 @@ impl Client {
 	}
 	#[tracing::instrument(skip(self), fields(client.id = self.id().to_string()))]
 	pub async fn spawn(self) -> JoinHandle<()> {
-		tokio::spawn(self.run())
+		tokio::spawn(self.run().instrument(Span::current()))
 	}
 }
 define_id_type!(Client, "cl_");

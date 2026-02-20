@@ -52,6 +52,7 @@ pub struct DmaBufTexture {
 }
 
 impl DmaBufTexture {
+	#[tracing::instrument(skip_all, fields(width = params.width, height = params.height, fourcc = params.fourcc))]
 	pub fn import(
 		gl: &gl::Gles2,
 		proc_resolver: &dyn Fn(&str) -> *const c_void,
@@ -169,6 +170,7 @@ impl DmaBufTexture {
 			protected: gpu::Protected::No,
 		}
 	}
+	#[tracing::instrument(skip_all)]
 	pub fn to_skia(self, label: impl AsRef<str>) -> Result<SkiaDmaBufTexture, DmaBufImportError> {
 
 

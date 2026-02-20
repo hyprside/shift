@@ -9,9 +9,16 @@ use skia_safe::{
 	self as skia, AlphaType, FilterMode, MipmapMode, Paint, SamplingOptions, gpu,
 	gpu::gl::FramebufferInfo,
 };
-use std::{collections::HashMap, hash::Hash, os::fd::OwnedFd};
+use std::{
+	collections::HashMap,
+	hash::Hash,
+	io::ErrorKind,
+	os::fd::{AsRawFd, OwnedFd},
+	sync::Arc,
+};
 use tab_protocol::BufferIndex;
 use thiserror::Error;
+use tokio::{io::unix::AsyncFd, sync::mpsc, task::JoinHandle};
 use tracing::warn;
 
 use crate::{
@@ -57,6 +64,7 @@ pub struct MonitorRenderState {
 }
 
 impl MonitorRenderState {
+	#[tracing::instrument(skip_all)]
 	fn new(req: &MonitorContextCreationRequest<'_>) -> Result<Self, RenderError> {
 		let interface = gpu::gl::Interface::new_load_with(|s| (req.get_proc_address)(s))
 			.ok_or(RenderError::SkiaGlInterface)?;
@@ -76,6 +84,7 @@ impl MonitorRenderState {
 		})
 	}
 
+	#[tracing::instrument(skip_all, fields(width = width, height = height))]
 	fn ensure_surface_size(&mut self, width: usize, height: usize) -> Result<(), RenderError> {
 		if self.width == width && self.height == height {
 			return Ok(());
@@ -104,6 +113,7 @@ impl MonitorRenderState {
 		}
 	}
 
+	#[tracing::instrument(skip_all, fields(monitor_id = %self.id))]
 	fn draw_texture(&mut self, texture: &SkiaDmaBufTexture) -> Result<(), RenderError> {
 		let Some(image) = skia::Image::from_texture(
 			&mut self.gr,
@@ -134,6 +144,7 @@ impl MonitorRenderState {
 #[derive(Default, Debug)]
 struct MonitorSurfaceState {
 	current_buffer: Option<BufferSlot>,
+	pending_buffer: Option<BufferSlot>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -157,6 +168,12 @@ impl SlotKey {
 enum BufferSlot {
 	Zero,
 	One,
+}
+
+#[derive(Debug)]
+enum FenceEvent {
+	Signaled { key: SlotKey },
+	Failed { key: SlotKey, reason: Arc<str> },
 }
 
 impl BufferSlot {
@@ -198,16 +215,21 @@ pub struct RenderingLayer {
 	known_monitors: HashMap<MonitorId, ServerLayerMonitor>,
 	monitor_state: HashMap<(MonitorId, SessionId), MonitorSurfaceState>,
 	slots: HashMap<SlotKey, SkiaDmaBufTexture>,
+	fence_event_tx: mpsc::UnboundedSender<FenceEvent>,
+	fence_event_rx: mpsc::UnboundedReceiver<FenceEvent>,
+	fence_waiters: HashMap<SlotKey, JoinHandle<()>>,
 	current_session: Option<SessionId>,
 }
 
 impl RenderingLayer {
+	#[tracing::instrument(skip_all)]
 	pub fn init(channels: RenderingEnd) -> Result<Self, RenderError> {
 		let (command_rx, event_tx) = channels.into_parts();
 		let drm = EasyDRM::init(|req| {
 			// O EasyDRM chama isto com o contexto do monitor já válido/current.
 			MonitorRenderState::new(req).expect("MonitorRenderState::new failed")
 		})?;
+		let (fence_event_tx, fence_event_rx) = mpsc::unbounded_channel();
 
 		Ok(Self {
 			drm,
@@ -216,10 +238,14 @@ impl RenderingLayer {
 			known_monitors: HashMap::new(),
 			monitor_state: HashMap::new(),
 			slots: HashMap::new(),
+			fence_event_tx,
+			fence_event_rx,
+			fence_waiters: HashMap::new(),
 			current_session: None,
 		})
 	}
 
+	#[tracing::instrument(skip_all)]
 	pub async fn run(mut self) -> Result<(), RenderError> {
 		let mut command_rx = self
 			.command_rx
@@ -254,19 +280,17 @@ impl RenderingLayer {
 
 					let texture = current_session
 						.and_then(|session_id| {
-							self.monitor_state
-								.get_mut(&(monitor_id, session_id))
-								.and_then(|state| state.current_buffer)
+							let state = self
+								.monitor_state
+								.entry((monitor_id, session_id))
+								.or_default();
+							state
+								.current_buffer
 								.map(|buffer| SlotKey::new(monitor_id, session_id, buffer))
 						})
-						.and_then(|key| {
-							self.slots
-								.get_mut(&key)
-						});
+						.and_then(|key| self.slots.get_mut(&key));
 					if let Some(texture) = texture {
 						unsafe{context.gl.ClearColor(1.0, 0.0, 0.0, 1.0)};
-						let canvas = context.canvas();
-						// texture.update();
 						if let Err(e) = context.draw_texture(texture) {
 							warn!(%monitor_id, "failed to draw client texture: {e:?}");
 						}
@@ -275,7 +299,24 @@ impl RenderingLayer {
 					context.flush();
 				}
 			}
-			self.drm.swap_buffers()?;
+			{
+				let page_flip_span = tracing::span!(tracing::Level::TRACE, "drm_page_flip_ioctl");
+				let _page_flip_enter = page_flip_span.enter();
+
+				let page_flipped_monitors = self
+					.drm
+					.monitors()
+					.filter(|m| m.was_drawn())
+					.map(|m| m.context().id)
+					.collect::<Vec<_>>();
+				self.drm.swap_buffers()?;
+
+				self
+					.emit_event(RenderEvt::PageFlip {
+						monitors: page_flipped_monitors,
+					})
+					.await;
+			}
 			'l: loop {
 				tokio::select! {
 					cmd = command_rx.recv() => {
@@ -290,28 +331,19 @@ impl RenderingLayer {
 					}
 					result = self.drm.poll_events_async() => {
 						result?;
-						self.on_after_poll_events().await;
+						self.sync_monitors().await;
 						break 'l;
+					}
+					fence_evt = self.fence_event_rx.recv() => {
+						if let Some(fence_evt) = fence_evt {
+							self.handle_fence_event(fence_evt);
+						}
 					}
 				}
 			}
 		};
 		warn!("shutting down renderer");
 		Ok(())
-	}
-	async fn on_after_poll_events(&mut self) {
-		let page_flipped_monitors = self
-			.drm
-			.monitors()
-			.filter(|m| m.can_render())
-			.map(|m| m.context().id)
-			.collect::<Vec<_>>();
-		self
-			.emit_event(RenderEvt::PageFlip {
-				monitors: page_flipped_monitors,
-			})
-			.await;
-		self.sync_monitors().await;
 	}
 	pub fn drm(&self) -> &EasyDRM<MonitorRenderState> {
 		&self.drm
@@ -325,6 +357,7 @@ impl RenderingLayer {
 			.collect()
 	}
 
+	#[tracing::instrument(skip_all)]
 	async fn sync_monitors(&mut self) {
 		let current_list = self.collect_monitors();
 		let mut current_map = HashMap::new();
@@ -370,12 +403,36 @@ impl RenderingLayer {
 
 	fn cleanup_monitor_slots(&mut self, monitor_id: MonitorId) {
 		self.slots.retain(|key, _| key.monitor_id != monitor_id);
+		let remove = self
+			.fence_waiters
+			.keys()
+			.filter(|key| key.monitor_id == monitor_id)
+			.copied()
+			.collect::<Vec<_>>();
+		for key in remove {
+			if let Some(waiter) = self.fence_waiters.remove(&key) {
+				waiter.abort();
+			}
+		}
 	}
 
 	fn cleanup_session_slots(&mut self, session_id: SessionId) {
 		self.slots.retain(|key, _| key.session_id != session_id);
+		self.monitor_state.retain(|(_, sess), _| *sess != session_id);
+		let remove = self
+			.fence_waiters
+			.keys()
+			.filter(|key| key.session_id == session_id)
+			.copied()
+			.collect::<Vec<_>>();
+		for key in remove {
+			if let Some(waiter) = self.fence_waiters.remove(&key) {
+				waiter.abort();
+			}
+		}
 	}
 
+	#[tracing::instrument(skip_all, fields(session_id = %session_id, monitor_id = %payload.monitor_id))]
 	fn import_framebuffers(
 		&mut self,
 		payload: tab_protocol::FramebufferLinkPayload,
@@ -440,6 +497,7 @@ impl RenderingLayer {
 }
 
 impl RenderingLayer {
+	#[tracing::instrument(skip_all)]
 	async fn handle_command(&mut self, cmd: RenderCmd) -> Result<bool, RenderError> {
 		match cmd {
 			RenderCmd::Shutdown => {
@@ -462,22 +520,157 @@ impl RenderingLayer {
 					self.current_session = None;
 				}
 			}
-			RenderCmd::SwapBuffers { monitor_id, buffer, session_id } => {
+			RenderCmd::SwapBuffers {
+				monitor_id,
+				buffer,
+				session_id,
+				acquire_fence,
+			} => {
 				let slot = BufferSlot::from(buffer);
-				self
-					.monitor_state
-					.entry((monitor_id, session_id))
-					.or_default()
-					.current_buffer = Some(slot);
+				let monitor_known = self.known_monitors.contains_key(&monitor_id);
+				let slot_key = SlotKey::new(monitor_id, session_id, slot);
+				let slot_known = self.slots.contains_key(&slot_key);
+				if !monitor_known || !slot_known {
+					let reason: Arc<str> = if !monitor_known {
+						"unknown_monitor"
+					} else {
+						"unlinked_buffer"
+					}
+					.into();
+					self
+						.emit_event(RenderEvt::BufferRequestRejected {
+							session_id,
+							monitor_id,
+							buffer,
+							reason,
+						})
+						.await;
+				} else {
+					let has_acquire_fence = acquire_fence.is_some();
+					if let Some(fence_fd) = acquire_fence {
+						self.spawn_acquire_fence_waiter(slot_key, fence_fd);
+					} else {
+						if let Some(waiter) = self.fence_waiters.remove(&slot_key) {
+							waiter.abort();
+						}
+					}
+					let state = self
+						.monitor_state
+						.entry((monitor_id, session_id))
+						.or_default();
+					state.pending_buffer = Some(slot);
+					if !has_acquire_fence {
+						state.current_buffer = Some(slot);
+						state.pending_buffer = None;
+					}
+					self
+						.emit_event(RenderEvt::BufferRequestAck {
+							session_id,
+							monitor_id,
+							buffer,
+						})
+						.await;
+				}
 			}
 		}
 
 		Ok(true)
 	}
 
+	#[tracing::instrument(skip_all)]
 	async fn emit_event(&self, event: RenderEvt) {
 		if let Err(e) = self.event_tx.send(event).await {
 			warn!("failed to send renderer event to server: {e}");
+		}
+	}
+
+	fn spawn_acquire_fence_waiter(&mut self, key: SlotKey, fence_fd: OwnedFd) {
+		if let Some(prev) = self.fence_waiters.remove(&key) {
+			prev.abort();
+		}
+		let tx = self.fence_event_tx.clone();
+		let handle = tokio::spawn(async move {
+			let afd = match AsyncFd::new(fence_fd) {
+				Ok(afd) => afd,
+				Err(e) => {
+					let _ = tx.send(FenceEvent::Failed {
+						key,
+						reason: format!("failed to register fence fd: {e}").into(),
+					});
+					return;
+				}
+			};
+			loop {
+				let mut guard = match afd.readable().await {
+					Ok(guard) => guard,
+					Err(e) => {
+						let _ = tx.send(FenceEvent::Failed {
+							key,
+							reason: format!("fence wait failed: {e}").into(),
+						});
+						return;
+					}
+				};
+				match guard.try_io(|inner| {
+					let fd = inner.as_raw_fd();
+					let mut poll_fd = nix::libc::pollfd {
+						fd,
+						events: (nix::libc::POLLIN | nix::libc::POLLERR | nix::libc::POLLHUP) as i16,
+						revents: 0,
+					};
+					let result = unsafe { nix::libc::poll(&mut poll_fd as *mut nix::libc::pollfd, 1, 0) };
+					if result > 0
+						&& (poll_fd.revents
+							& (nix::libc::POLLIN | nix::libc::POLLERR | nix::libc::POLLHUP) as i16)
+							!= 0
+					{
+						Ok(())
+					} else {
+						Err(std::io::Error::new(
+							ErrorKind::WouldBlock,
+							"fence not signaled yet",
+						))
+					}
+				}) {
+					Ok(Ok(())) => {
+						let _ = tx.send(FenceEvent::Signaled { key });
+						return;
+					}
+					Ok(Err(e)) => {
+						let _ = tx.send(FenceEvent::Failed {
+							key,
+							reason: format!("fence poll failed: {e}").into(),
+						});
+						return;
+					}
+					Err(_would_block) => continue,
+				}
+			}
+		});
+		self.fence_waiters.insert(key, handle);
+	}
+
+	fn handle_fence_event(&mut self, event: FenceEvent) {
+		match event {
+			FenceEvent::Signaled { key } => {
+				self.fence_waiters.remove(&key);
+				if let Some(state) = self.monitor_state.get_mut(&(key.monitor_id, key.session_id)) {
+					if state.pending_buffer == Some(key.buffer) {
+						state.current_buffer = Some(key.buffer);
+						state.pending_buffer = None;
+					}
+				}
+			}
+			FenceEvent::Failed { key, reason } => {
+				self.fence_waiters.remove(&key);
+				warn!(%key.monitor_id, %key.session_id, buffer = ?key.buffer, %reason, "fence waiter failed, promoting pending buffer");
+				if let Some(state) = self.monitor_state.get_mut(&(key.monitor_id, key.session_id)) {
+					if state.pending_buffer == Some(key.buffer) {
+						state.current_buffer = Some(key.buffer);
+						state.pending_buffer = None;
+					}
+				}
+			}
 		}
 	}
 }

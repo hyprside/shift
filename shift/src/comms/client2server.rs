@@ -8,9 +8,10 @@ pub enum C2SMsg {
 	Shutdown,
 	Auth(Token),
 	CreateSession(SessionCreatePayload),
-	SwapBuffers {
+	BufferRequest {
 		monitor_id: MonitorId,
 		buffer: BufferIndex,
+		acquire_fence: Option<OwnedFd>,
 	},
 	FramebufferLink {
 		payload: FramebufferLinkPayload,

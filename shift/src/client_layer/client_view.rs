@@ -5,7 +5,7 @@ use crate::{
 	client_layer::client::{Client, ClientId},
 	comms::{
 		client2server::{C2SMsg, C2SRx, C2STx, C2SWeakTx},
-		server2client::{S2CMsg, S2CRx, S2CTx},
+		server2client::{BufferRelease, S2CMsg, S2CRx, S2CTx},
 	},
 	monitor::{Monitor, MonitorId},
 	sessions::{PendingSession, Session, SessionId},
@@ -40,8 +40,8 @@ pub struct Channels {
 }
 impl Channels {
 	pub(super) fn new() -> Self {
-		let c2s = tokio::sync::mpsc::channel(1000);
-		let s2c = tokio::sync::mpsc::channel(1000);
+		let c2s = tokio::sync::mpsc::channel(5000);
+		let s2c = tokio::sync::mpsc::channel(5000);
 		Self {
 			client_end: ChannelsClientEnd(s2c.1, c2s.0),
 			server_end: ChannelsServerEnd(c2s.1, s2c.0),
@@ -124,11 +124,24 @@ impl ClientView {
 		self.session_id
 	}
 
-	pub async fn notify_frame_done(&mut self, monitors: Vec<MonitorId>) -> bool {
+	pub async fn notify_buffer_release(&mut self, buffers: Vec<BufferRelease>) -> bool {
 		self
 			.channels
 			.1
-			.send(S2CMsg::FrameDone { monitors })
+			.send(S2CMsg::BufferRelease { buffers })
+			.await
+			.is_ok()
+	}
+
+	pub async fn notify_buffer_request_ack(
+		&mut self,
+		monitor_id: MonitorId,
+		buffer: tab_protocol::BufferIndex,
+	) -> bool {
+		self
+			.channels
+			.1
+			.send(S2CMsg::BufferRequestAck { monitor_id, buffer })
 			.await
 			.is_ok()
 	}

@@ -1,12 +1,18 @@
-use std::{borrow::Cow, sync::Arc};
+use std::sync::Arc;
 
-use tab_protocol::SessionRole;
+use tab_protocol::BufferIndex;
 
 use crate::{
 	auth::{self, Token},
 	monitor::{Monitor, MonitorId},
-	sessions::{self, PendingSession, Session, SessionId},
+	sessions::{PendingSession, Session},
 };
+
+#[derive(Debug, Clone, Copy)]
+pub struct BufferRelease {
+	pub monitor_id: MonitorId,
+	pub buffer: BufferIndex,
+}
 
 #[derive(Debug)]
 pub enum S2CMsg {
@@ -18,8 +24,12 @@ pub enum S2CMsg {
 		error: Option<Arc<str>>,
 		shutdown: bool,
 	},
-	FrameDone {
-		monitors: Vec<MonitorId>,
+	BufferRelease {
+		buffers: Vec<BufferRelease>,
+	},
+	BufferRequestAck {
+		monitor_id: MonitorId,
+		buffer: BufferIndex,
 	},
 	MonitorAdded {
 		monitor: Monitor,

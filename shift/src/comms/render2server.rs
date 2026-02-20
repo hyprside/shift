@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use crate::monitor::{Monitor, MonitorId};
+use tab_protocol::BufferIndex;
+
+use crate::{monitor::{Monitor, MonitorId}, sessions::SessionId};
 
 /// Events emitted by the rendering layer back into the server core.
 #[derive(Debug)]
@@ -18,6 +20,19 @@ pub enum RenderEvt {
 	FatalError { reason: Arc<str> },
 	/// Some monitors just page flipped and are ready to be commited to again
 	PageFlip { monitors: Vec<MonitorId> },
+	/// Renderer has accepted and applied a buffer request to its internal state.
+	BufferRequestAck {
+		session_id: SessionId,
+		monitor_id: MonitorId,
+		buffer: BufferIndex,
+	},
+	/// Renderer rejected a buffer request after inspecting local state.
+	BufferRequestRejected {
+		session_id: SessionId,
+		monitor_id: MonitorId,
+		buffer: BufferIndex,
+		reason: Arc<str>,
+	},
 }
 
 pub type RenderEvtRx = tokio::sync::mpsc::Receiver<RenderEvt>;
